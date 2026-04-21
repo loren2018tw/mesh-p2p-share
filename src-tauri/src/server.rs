@@ -469,6 +469,7 @@ pub async fn send_file_chunks_info(
 }
 
 pub async fn run_server(
+    app_handle: tauri::AppHandle,
     service_url: Arc<TokioMutex<Option<String>>>,
     p2p_state: SharedState,
     ws_senders: crate::WsSenders,
@@ -478,8 +479,15 @@ pub async fn run_server(
         ws_senders,
     };
 
-    let serve_dir = ServeDir::new("downloader-dist")
-        .not_found_service(ServeFile::new("downloader-dist/index.html"));
+    use tauri::Manager;
+    let resource_dir = app_handle
+        .path()
+        .resource_dir()
+        .expect("Failed to get resource dir")
+        .join("downloader-dist");
+
+    let serve_dir = ServeDir::new(resource_dir.clone())
+        .not_found_service(ServeFile::new(resource_dir.join("index.html")));
 
     let app = Router::new()
         .route("/ws", get(ws_handler))

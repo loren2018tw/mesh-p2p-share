@@ -114,11 +114,12 @@ pub fn run() {
             get_file_size,
             get_app_version
         ])
-        .setup(move |_app| {
+        .setup(move |app| {
+            let app_handle = app.handle().clone();
             let p2p_clone = p2p_state.clone();
             let ws_senders_clone = ws_senders.clone();
             tauri::async_runtime::spawn(async move {
-                server::run_server(url_state, p2p_clone, ws_senders_clone).await;
+                server::run_server(app_handle, url_state, p2p_clone, ws_senders_clone).await;
             });
             Ok(())
         })
