@@ -1,6 +1,6 @@
 schema: spec-driven
 
-  context: |
-    Tech stack: TypeScript, Vue, Vuetify 作為前端元件框架, Rust
-    Language: 繁體中文
-    所有規格書使用繁體中文撰寫
+context: |
+  Tech stack: TypeScript, Vue, Vuetify 作為前端元件框架, Rust
+  Language: 繁體中文
+  所有規格書使用繁體中文撰寫

@@ -28,3 +28,6 @@ axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 tokio = { version = "1.52.1", features = ["full"] }
 tower-http = { version = "0.6.8", features = ["fs"] }
 rcgen = "0.9.2"
+crc32fast = "1"
+uuid = { version = "1", features = ["v4"] }
+futures-util = "0.3"

@@ -8,11 +8,22 @@ interface SharedFile {
   path: string;
   name: string;
   size: string;
+  file_id: string;
+  chunk_count: number;
+  processing: boolean;
+}
+
+interface FileListItem {
+  file_id: string;
+  file_name: string;
+  total_size: number;
+  chunk_count: number;
 }
 
 const serviceUrl = ref("");
 const qrCodeDataUrl = ref("");
 const qrDialog = ref(false);
+const appVersion = ref("...");
 const snackbar = ref(false);
 const snackbarText = ref("");
 const snackbarColor = ref("success");
@@ -23,7 +34,7 @@ async function loadServiceUrl(retry = 20) {
     const url = await invoke<string>("get_service_url");
     serviceUrl.value = url;
     qrCodeDataUrl.value = await QRCode.toDataURL(url, {
-      width: 160,
+      width: 800, // 高解析度以便放大不失真
       margin: 2,
       color: { dark: "#5C3D1E", light: "#F8F2E4" },
     });
@@ -62,17 +73,42 @@ async function copyServiceUrl() {
 
 async function addSharedFile(path: string) {
   const exists = sharedFiles.value.some((item) => item.path === path);
-  if (!exists) {
-    let sizeLabel = "無法取得大小";
-    try {
-      const bytes = await invoke<number>("get_file_size", { path });
-      if (bytes != null) sizeLabel = formatBytes(bytes);
-    } catch {}
-    const name = path.split(/[\\/]/).pop() || path;
-    sharedFiles.value.push({ path, name, size: sizeLabel });
+  if (exists) {
+    notify("此檔案已在分享清單中", "warning");
+    return;
   }
-  await invoke("share_file", { path });
-  notify("檔案已新增至分享清單");
+  // 先加入清單（顯示處理中狀態）
+  const name = path.split(/[\\/]/).pop() || path;
+  const tempEntry: SharedFile = {
+    path,
+    name,
+    size: "處理中...",
+    file_id: "",
+    chunk_count: 0,
+    processing: true,
+  };
+  sharedFiles.value.push(tempEntry);
+
+  try {
+    const result = await invoke<FileListItem>("share_file", { path });
+    // 更新已處理完成的資訊
+    const idx = sharedFiles.value.findIndex((f) => f.path === path);
+    if (idx >= 0) {
+      sharedFiles.value[idx] = {
+        path,
+        name: result.file_name,
+        size: formatBytes(result.total_size),
+        file_id: result.file_id,
+        chunk_count: result.chunk_count,
+        processing: false,
+      };
+    }
+    notify(`檔案已新增至分享清單（${result.chunk_count} 個區塊）`);
+  } catch (e: any) {
+    // 處理失敗時移除
+    sharedFiles.value = sharedFiles.value.filter((f) => f.path !== path);
+    notify(`檔案處理失敗：${e}`, "error");
+  }
 }
 
 async function addFile() {
@@ -90,13 +126,19 @@ async function addFile() {
   }
 }
 
-function removeFile(path: string) {
+async function removeFile(path: string) {
+  try {
+    await invoke("remove_shared_file", { path });
+  } catch {}
   sharedFiles.value = sharedFiles.value.filter((f) => f.path !== path);
   notify("已移除分享檔案", "info");
 }
 
-onMounted(() => {
+onMounted(async () => {
   loadServiceUrl();
+  try {
+    appVersion.value = await invoke<string>("get_app_version");
+  } catch {}
 });
 </script>
 
@@ -110,6 +152,19 @@ onMounted(() => {
       <v-app-bar-title class="app-title text-white font-weight-bold">
         Mesh P2P Share
       </v-app-bar-title>
+      <template #append>
+        <div class="d-flex align-center text-caption text-white mr-4">
+          <span class="mr-2">v{{ appVersion }} by Loren(loren.tw@gmail.com)</span>
+          <v-btn
+            icon="mdi-github"
+            variant="text"
+            size="small"
+            color="white"
+            href="https://github.com/loren2018tw/mesh-p2p-share"
+            target="_blank"
+          />
+        </div>
+      </template>
     </v-app-bar>
 
     <v-main>
@@ -244,7 +299,7 @@ onMounted(() => {
                   <template v-for="(file, idx) in sharedFiles" :key="file.path">
                     <v-list-item
                       :title="file.name"
-                      :subtitle="file.size"
+                      :subtitle="file.processing ? '處理中...' : `${file.size} · ${file.chunk_count} 個區塊`"
                       class="py-3"
                     >
                       <template #prepend>
@@ -293,20 +348,19 @@ onMounted(() => {
     </v-main>
 
     <!-- QR 放大 Dialog -->
-    <v-dialog v-model="qrDialog" width="340">
-      <v-card rounded="lg" class="text-center">
-        <v-card-title class="pt-6 text-h6 font-weight-bold section-title"
+    <v-dialog v-model="qrDialog" width="auto">
+      <v-card rounded="lg" class="text-center" style="max-width: 95vw; max-height: 95vh; display: flex; flex-direction: column;">
+        <v-card-title class="pt-6 text-h6 font-weight-bold section-title flex-shrink-0"
           >掃描 QR Code</v-card-title
         >
-        <v-card-subtitle class="mb-2">下載端掃描後即可連入</v-card-subtitle>
-        <v-card-text class="pb-5">
+        <v-card-subtitle class="mb-2 flex-shrink-0">下載端掃描後即可連入</v-card-subtitle>
+        <v-card-text class="pb-5 d-flex justify-center align-center" style="overflow: hidden;">
           <img
             v-if="qrCodeDataUrl"
             :src="qrCodeDataUrl"
             alt="QR Code"
-            width="280"
-            height="280"
             class="qr-dialog-img"
+            style="max-width: 100%; max-height: 65vh; object-fit: contain; border-radius: 8px;"
           />
         </v-card-text>
         <v-card-actions class="pb-4">
