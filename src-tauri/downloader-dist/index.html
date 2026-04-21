@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mesh P2P Share - 下載端</title>
+  <link href="https://cdn.jsdelivr.net/npm/@mdi/font@5.x/css/materialdesignicons.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/vuetify@3.5.0/dist/vuetify.min.css" rel="stylesheet">
+  <style>
+    [v-cloak] { display: none; }
+  </style>
+</head>
+<body>
+  <div id="app" v-cloak>
+    <v-app>
+      <v-app-bar title="Mesh P2P Share - 下載端" color="primary"></v-app-bar>
+      <v-main>
+        <v-container class="fill-height">
+          <v-row justify="center" align="center">
+            <v-col cols="12" md="8" lg="6">
+              <v-card class="pa-6 text-center" elevation="4">
+                <v-icon icon="mdi-download-network-outline" size="64" color="primary" class="mb-4"></v-icon>
+                <h2 class="text-h5 mb-4">等待分享端連線...</h2>
+                <v-alert
+                  :type="wsStatus === 'connected' ? 'success' : 'warning'"
+                  variant="tonal"
+                  class="mb-4"
+                >
+                  信令伺服器狀態: {{ wsStatusText }}
+                </v-alert>
+                
+                <div v-if="messages.length > 0" class="mt-4 text-left">
+                  <h3 class="text-h6 mb-2">接收到的信令訊息:</h3>
+                  <v-list density="compact" bg-color="grey-lighten-4" class="rounded">
+                    <v-list-item v-for="(msg, i) in messages" :key="i">
+                      <v-list-item-title class="text-body-2">{{ msg }}</v-list-item-title>
+                    </v-list-item>
+                  </v-list>
+                </div>
+              </v-card>
+            </v-col>
+          </v-row>
+        </v-container>
+      </v-main>
+    </v-app>
+  </div>
+
+  <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/vuetify@3.5.0/dist/vuetify.min.js"></script>
+  <script>
+    const { createApp, ref, onMounted } = Vue;
+    const { createVuetify } = Vuetify;
+
+    const vuetify = createVuetify();
+
+    const app = createApp({
+      setup() {
+        const wsStatus = ref('connecting');
+        const wsStatusText = ref('連線中...');
+        const messages = ref([]);
+        let ws = null;
+
+        onMounted(() => {
+          connectWebSocket();
+        });
+
+        function connectWebSocket() {
+          const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+          const wsUrl = `${protocol}//${window.location.host}/ws`;
+          
+          ws = new WebSocket(wsUrl);
+          
+          ws.onopen = () => {
+            wsStatus.value = 'connected';
+            wsStatusText.value = '已連線至信令伺服器';
+            // 傳送測試訊息
+            ws.send(JSON.stringify({ type: 'hello', role: 'downloader' }));
+          };
+          
+          ws.onmessage = (event) => {
+            messages.value.push(event.data);
+          };
+          
+          ws.onclose = () => {
+            wsStatus.value = 'disconnected';
+            wsStatusText.value = '已斷線，嘗試重新連線中...';
+            setTimeout(connectWebSocket, 3000);
+          };
+          
+          ws.onerror = (error) => {
+            console.error('WebSocket 錯誤:', error);
+          };
+        }
+
+        return {
+          wsStatus,
+          wsStatusText,
+          messages
+        };
+      }
+    });
+
+    app.use(vuetify).mount('#app');
+  </script>
+</body>
+</html>
