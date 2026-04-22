@@ -20,6 +20,12 @@ interface FileListItem {
   chunk_count: number;
 }
 
+interface AppStats {
+  connected_peers: number;
+  downloading_peers: number;
+  sharing_peers: number;
+}
+
 const serviceUrl = ref("");
 const qrCodeDataUrl = ref("");
 const qrDialog = ref(false);
@@ -28,6 +34,11 @@ const snackbar = ref(false);
 const snackbarText = ref("");
 const snackbarColor = ref("success");
 const sharedFiles = ref<SharedFile[]>([]);
+const appStats = ref<AppStats>({
+  connected_peers: 0,
+  downloading_peers: 0,
+  sharing_peers: 0,
+});
 
 async function loadServiceUrl(retry = 20) {
   try {
@@ -43,6 +54,13 @@ async function loadServiceUrl(retry = 20) {
       setTimeout(() => loadServiceUrl(retry - 1), 1000);
     }
   }
+}
+
+async function loadAppStats() {
+  try {
+    appStats.value = await invoke<AppStats>("get_app_stats");
+  } catch {}
+  setTimeout(loadAppStats, 2000);
 }
 
 function formatBytes(bytes: number): string {
@@ -113,14 +131,20 @@ async function addSharedFile(path: string) {
 
 async function addFile() {
   try {
-    const file = await open({ multiple: false, directory: false });
-    const path =
-      typeof file === "string"
-        ? file
-        : file && typeof file === "object" && "path" in file
-          ? (file as any).path
-          : null;
-    if (path) await addSharedFile(path);
+    const selected = await open({ multiple: true, directory: false });
+    if (!selected) return;
+
+    const files = Array.isArray(selected) ? selected : [selected];
+
+    for (const file of files) {
+      const path =
+        typeof file === "string"
+          ? file
+          : file && typeof file === "object" && "path" in file
+            ? (file as any).path
+            : null;
+      if (path) await addSharedFile(path);
+    }
   } catch (e: any) {
     notify(`發生錯誤：${e}`, "error");
   }
@@ -136,6 +160,7 @@ async function removeFile(path: string) {
 
 onMounted(async () => {
   loadServiceUrl();
+  loadAppStats();
   try {
     appVersion.value = await invoke<string>("get_app_version");
   } catch {}
@@ -169,8 +194,8 @@ onMounted(async () => {
 
     <v-main>
       <v-container class="py-8 px-4">
-        <v-row justify="center">
-          <v-col cols="12" lg="9" xl="7">
+        <v-row>
+          <v-col cols="12" lg="8">
             <!-- ── 入口網址 Card ── -->
             <v-card class="mb-5 url-card" elevation="2" rounded="lg">
               <v-card-item class="pt-5 pb-2">
@@ -292,32 +317,49 @@ onMounted(async () => {
               <v-card-text class="pa-0">
                 <v-list
                   v-if="sharedFiles.length"
-                  lines="two"
                   bg-color="transparent"
                   class="py-0"
                 >
                   <template v-for="(file, idx) in sharedFiles" :key="file.path">
-                    <v-list-item
-                      :title="file.name"
-                      :subtitle="file.processing ? '處理中...' : `${file.size} · ${file.chunk_count} 個區塊`"
-                      class="py-3"
-                    >
+                    <v-list-item class="py-3">
                       <template #prepend>
                         <v-avatar
                           color="primary"
                           variant="tonal"
                           size="40"
-                          class="mr-1"
+                          class="mr-3"
                         >
                           <v-icon icon="mdi-file-outline" size="20" />
                         </v-avatar>
                       </template>
+
+                      <div class="d-flex align-center justify-space-between w-100">
+                        <div class="d-flex align-center flex-grow-1 text-truncate">
+                          <span class="font-weight-medium text-truncate mr-3">{{ file.name }}</span>
+                          <template v-if="file.processing">
+                            <v-progress-linear
+                              indeterminate
+                              color="primary"
+                              height="4"
+                              rounded
+                              class="flex-grow-1 mx-2"
+                              style="max-width: 100px"
+                            ></v-progress-linear>
+                            <span class="text-caption text-medium-emphasis">處理中...</span>
+                          </template>
+                        </div>
+                        <div v-if="!file.processing" class="text-caption text-medium-emphasis ml-4 flex-shrink-0">
+                          {{ file.size }} · {{ file.chunk_count }} 個區塊
+                        </div>
+                      </div>
+
                       <template #append>
                         <v-btn
                           icon="mdi-delete-outline"
                           color="error"
                           variant="text"
                           size="small"
+                          class="ml-2"
                           @click="removeFile(file.path)"
                         />
                       </template>
@@ -342,6 +384,71 @@ onMounted(async () => {
                 </div>
               </v-card-text>
             </v-card>
+          </v-col>
+
+          <!-- ── 資訊面板 ── -->
+          <v-col cols="12" lg="4">
+            <v-card elevation="2" rounded="lg" class="mb-5">
+              <v-card-item class="pt-5 pb-2">
+                <template #prepend>
+                  <v-avatar color="info" variant="tonal" size="44">
+                    <v-icon icon="mdi-information-outline" />
+                  </v-avatar>
+                </template>
+                <v-card-title class="text-h6 font-weight-bold section-title">
+                  系統資訊
+                </v-card-title>
+              </v-card-item>
+              <v-divider class="mx-4" />
+              <v-card-text class="pa-2">
+                <v-list density="compact" bg-color="transparent">
+                  <v-list-item>
+                    <template #prepend>
+                      <v-icon icon="mdi-lan-connect" color="primary" class="mr-2" />
+                    </template>
+                    <v-list-item-title>目前連線終端數</v-list-item-title>
+                    <template #append>
+                      <v-chip size="small" color="primary" variant="tonal" class="font-weight-bold">
+                        {{ appStats.connected_peers }}
+                      </v-chip>
+                    </template>
+                  </v-list-item>
+                  <v-list-item>
+                    <template #prepend>
+                      <v-icon icon="mdi-upload-network" color="success" class="mr-2" />
+                    </template>
+                    <v-list-item-title>目前分享中 (Seed)</v-list-item-title>
+                    <template #append>
+                      <v-chip size="small" color="success" variant="tonal" class="font-weight-bold">
+                        {{ appStats.sharing_peers }}
+                      </v-chip>
+                    </template>
+                  </v-list-item>
+                  <v-list-item>
+                    <template #prepend>
+                      <v-icon icon="mdi-download-network" color="info" class="mr-2" />
+                    </template>
+                    <v-list-item-title>目前下載中 (Leech)</v-list-item-title>
+                    <template #append>
+                      <v-chip size="small" color="info" variant="tonal" class="font-weight-bold">
+                        {{ appStats.downloading_peers }}
+                      </v-chip>
+                    </template>
+                  </v-list-item>
+                </v-list>
+              </v-card-text>
+            </v-card>
+
+            <!-- 提示說明 -->
+            <v-alert
+              type="info"
+              variant="tonal"
+              density="compact"
+              class="text-caption"
+              rounded="lg"
+            >
+              本系統採用 P2P 網狀傳輸技術，下載端也會參與分享，連線人數越多下載速度越快。
+            </v-alert>
           </v-col>
         </v-row>
       </v-container>

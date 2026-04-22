@@ -16,6 +16,13 @@ pub struct FileListItem {
     pub chunk_count: u32,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AppStats {
+    pub connected_peers: u32,
+    pub downloading_peers: u32,
+    pub sharing_peers: u32,
+}
+
 /// 各端點的 WebSocket 發送通道 (key = endpoint_id)
 pub type WsSenders = Arc<RwLock<HashMap<String, mpsc::UnboundedSender<server::ServerMessage>>>>;
 
@@ -89,6 +96,29 @@ fn get_file_size(path: String) -> Result<u64, String> {
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn get_app_stats(state: State<'_, AppState>) -> Result<AppStats, String> {
+    let s = state.p2p_state.read().await;
+    let connected_peers = s.endpoints.len().saturating_sub(1) as u32; // Exclude host
+    let mut downloading_peers = 0;
+    let mut sharing_peers = 0;
+
+    for ep in s.endpoints.values() {
+        if ep.download_count > 0 {
+            downloading_peers += 1;
+        }
+        if ep.upload_count > 0 {
+            sharing_peers += 1;
+        }
+    }
+
+    Ok(AppStats {
+        connected_peers,
+        downloading_peers,
+        sharing_peers,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let host_id = uuid::Uuid::new_v4().to_string();
@@ -112,7 +142,8 @@ pub fn run() {
             remove_shared_file,
             get_service_url,
             get_file_size,
-            get_app_version
+            get_app_version,
+            get_app_stats
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();

@@ -69,16 +69,45 @@ class P2PDownloader {
     if (this._statusInterval) clearInterval(this._statusInterval);
     this._statusInterval = setInterval(() => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-      if (!this.activeDownload) return;
-      const owned = Array.from(this.activeDownload.ownedChunks);
-      this.ws.send(JSON.stringify({
-        type: 'endpoint_status',
-        endpoint_id: this.endpointId,
-        file_id: this.activeDownload.fileId,
-        owned_chunks: owned,
-        upload_count: this.uploadCount,
-        download_count: this.downloadCount
-      }));
+
+      // 收集所有需要報告狀態的檔案 ID
+      const fileIds = new Set(this.completedFiles);
+      if (this.activeDownload) fileIds.add(this.activeDownload.fileId);
+
+      // 如果沒有任何檔案也要報告基本的連線資訊（主要是 upload/download count）
+      if (fileIds.size === 0) {
+        this.ws.send(JSON.stringify({
+          type: 'endpoint_status',
+          endpoint_id: this.endpointId,
+          file_id: '', // 空 ID 表示基本狀態
+          owned_chunks: [],
+          upload_count: this.uploadCount,
+          download_count: this.downloadCount
+        }));
+        return;
+      }
+
+      for (const fileId of fileIds) {
+        let owned = [];
+        if (this.activeDownload && this.activeDownload.fileId === fileId) {
+          owned = Array.from(this.activeDownload.ownedChunks);
+        } else if (this.completedFiles.has(fileId)) {
+          // 如果已完成，則擁有所有區塊
+          const file = this.files.find(f => f.file_id === fileId);
+          if (file) {
+            for (let i = 0; i < file.chunk_count; i++) owned.push(i);
+          }
+        }
+
+        this.ws.send(JSON.stringify({
+          type: 'endpoint_status',
+          endpoint_id: this.endpointId,
+          file_id: fileId,
+          owned_chunks: owned,
+          upload_count: this.uploadCount,
+          download_count: this.downloadCount
+        }));
+      }
     }, 2000);
   }
 

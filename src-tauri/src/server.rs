@@ -183,7 +183,27 @@ async fn get_chunk_data(
     Path((file_id, chunk_index)): Path<(String, u32)>,
     AxumState(state): AxumState<ServerState>,
 ) -> impl IntoResponse {
-    match p2p::read_chunk_data(&state.p2p_state, &file_id, chunk_index).await {
+    // 增加 host 的上傳計數
+    {
+        let mut s = state.p2p_state.write().await;
+        let host_id = s.host_endpoint_id.clone();
+        if let Some(ep) = s.endpoints.get_mut(&host_id) {
+            ep.upload_count += 1;
+        }
+    }
+
+    let result = p2p::read_chunk_data(&state.p2p_state, &file_id, chunk_index).await;
+
+    // 減少 host 的上傳計數
+    {
+        let mut s = state.p2p_state.write().await;
+        let host_id = s.host_endpoint_id.clone();
+        if let Some(ep) = s.endpoints.get_mut(&host_id) {
+            ep.upload_count = ep.upload_count.saturating_sub(1);
+        }
+    }
+
+    match result {
         Ok(data) => (
             StatusCode::OK,
             [("content-type", "application/octet-stream")],
@@ -300,9 +320,11 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
             } => {
                 let mut s = state.p2p_state.write().await;
                 if let Some(ep) = s.endpoints.get_mut(&eid) {
-                    ep.file_id = Some(file_id.clone());
-                    let chunks: HashSet<u32> = owned_chunks.into_iter().collect();
-                    ep.owned_chunks.insert(file_id, chunks);
+                    if !file_id.is_empty() {
+                        ep.file_id = Some(file_id.clone());
+                        let chunks: HashSet<u32> = owned_chunks.into_iter().collect();
+                        ep.owned_chunks.insert(file_id, chunks);
+                    }
                     ep.upload_count = upload_count;
                     ep.download_count = download_count;
                 }
