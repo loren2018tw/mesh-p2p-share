@@ -133,6 +133,9 @@ class P2PDownloader {
       case 'suggest_peer':
         this._handleSuggestPeer(msg);
         break;
+      case 'suggest_download':
+        this._handleSuggestDownload(msg);
+        break;
       case 'wait_and_retry':
         this._handleWaitAndRetry(msg);
         break;
@@ -150,7 +153,7 @@ class P2PDownloader {
     this.activeDownload.fileInfo = msg;
     this.activeDownload.totalChunks = msg.chunk_count;
     this.log(`收到檔案區塊資訊: ${msg.file_name}, ${msg.chunk_count} 個區塊`);
-    this._requestNextChunks();
+    // 現在只需要儲存檔案資訊，等待中控的 SuggestDownload 指令
   }
 
   // ── File System Access API & 啟動下載 ──
@@ -197,7 +200,7 @@ class P2PDownloader {
       const dl = this.activeDownload;
       this.activeDownload = null;
       this.pendingRequests.clear();
-      
+
       // 關閉所有 WebRTC 連線
       for (const [key, conn] of this.peerConnections) {
         if (conn.fileId === fileId) {
@@ -213,7 +216,7 @@ class P2PDownloader {
       } catch (e) {
         this.log(`中止檔案寫入失敗: ${e.message}`);
       }
-      
+
       const fileName = this.files.find(f => f.file_id === fileId)?.file_name;
       this.log(`已取消下載：${fileName}`);
       this._notifyStateChange();
@@ -231,48 +234,53 @@ class P2PDownloader {
       task.startTime = Date.now();
       this.activeDownload = task;
       this.pendingRequests.clear();
-      
+
       const fileName = this.files.find(f => f.file_id === task.fileId)?.file_name;
       this.log(`開始下載: ${fileName}`);
       this._notifyStateChange();
 
-      // 向中控中心請求第一個區塊（會觸發 file_chunks_info 回傳）
-      this._requestNextChunks();
+      // 向中控中心回報下載意圖，會觸發 file_chunks_info 回傳
+      this._send({ type: 'start_download', endpoint_id: this.endpointId, file_id: task.fileId });
     } catch (e) {
       this.log(`無法開啟寫入: ${e.message}`);
       this._checkQueue();
     }
   }
 
-  // ── 隨機區塊請求 ──
+  // ── 被動等待中控分配（不再主動請求） ──
   _requestNextChunks() {
     if (!this.activeDownload) return;
     const dl = this.activeDownload;
-    const missing = [];
-    for (let i = 0; i < dl.totalChunks; i++) {
-      if (!dl.ownedChunks.has(i) && !this.pendingRequests.has(i)) missing.push(i);
-    }
-    if (missing.length === 0 && dl.ownedChunks.size >= dl.totalChunks) {
+
+    // 檢查是否已完成所有分片
+    if (dl.ownedChunks.size >= dl.totalChunks) {
       this._finalizeDownload();
       return;
     }
-    // 隨機打亂並取最多 maxConcurrentDownloads 個
-    this._shuffle(missing);
-    const toRequest = missing.slice(0, this.maxConcurrentDownloads - this.pendingRequests.size);
-    for (const idx of toRequest) {
-      this.pendingRequests.add(idx);
-      this._send({ type: 'request_chunk', endpoint_id: this.endpointId, file_id: dl.fileId, chunk_index: idx });
+    // 已改為被動等待中控的 SuggestDownload 指令
+    // 此函數現在只用於檢查完成狀態
+  }
+
+
+
+  // ── 中控下載指令：主動分配下載任務 ──
+  _handleSuggestDownload(msg) {
+    const { file_id, chunk_index, source_peer } = msg;
+    if (!this.activeDownload || this.activeDownload.fileId !== file_id) return;
+    if (this.activeDownload.ownedChunks.has(chunk_index)) return; // 已擁有此分片
+
+    this.log(`中控指令: 區塊 ${chunk_index} 來自 ${source_peer.slice(0, 8)}...`);
+    this.pendingRequests.add(chunk_index);
+
+    // 如果來源是 host（分享端），透過 HTTP 下載
+    if (source_peer === this.hostEndpointId || source_peer === 'host' || !source_peer) {
+      this._downloadChunkViaHttp(file_id, chunk_index);
+    } else {
+      this._downloadChunkViaWebRTC(file_id, chunk_index, source_peer);
     }
   }
 
-  _shuffle(arr) {
-    for (let i = arr.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [arr[i], arr[j]] = [arr[j], arr[i]];
-    }
-  }
-
-  // ── 排程回應處理 ──
+  // ── 排程回應處理（向後兼容） ──
   _handleSuggestPeer(msg) {
     const { file_id, chunk_index, peer_id } = msg;
     this.log(`排程建議: 區塊 ${chunk_index} → 端點 ${peer_id.slice(0, 8)}...`);
@@ -289,15 +297,8 @@ class P2PDownloader {
     const { chunk_index, wait_seconds } = msg;
     this.log(`等待重試: 區塊 ${chunk_index}，${wait_seconds} 秒後`);
     this.pendingRequests.delete(chunk_index);
-    setTimeout(() => {
-      if (this.activeDownload && !this.activeDownload.ownedChunks.has(chunk_index)) {
-        this.pendingRequests.add(chunk_index);
-        this._send({
-          type: 'request_chunk', endpoint_id: this.endpointId,
-          file_id: msg.file_id, chunk_index
-        });
-      }
-    }, wait_seconds * 1000);
+    // 在新模式下已不需要此邏輯，因為由中控決定何時分配
+    // 但保留以向後兼容
   }
 
   // ── HTTP 區塊下載（從 Host 種子） ──
@@ -313,7 +314,7 @@ class P2PDownloader {
     } catch (e) {
       this.log(`HTTP 下載區塊 ${chunkIndex} 失敗: ${e.message}`);
       this.pendingRequests.delete(chunkIndex);
-      setTimeout(() => this._requestNextChunks(), 1000);
+      // 在新模式下，中控會自動重新分配失敗的分片
     } finally {
       this.downloadCount--;
       this._notifyStateChange();
@@ -380,7 +381,6 @@ class P2PDownloader {
           this.downloadCount--;
           this._notifyStateChange();
           this._send({ type: 'transfer_finished', endpoint_id: this.endpointId, file_id: fileId, chunk_index: chunkIndex, is_upload: false });
-          this._requestNextChunks();
         }
       }, 30000);
     } catch (e) {
@@ -388,7 +388,7 @@ class P2PDownloader {
       this.downloadCount--;
       this.pendingRequests.delete(chunkIndex);
       this._notifyStateChange();
-      setTimeout(() => this._requestNextChunks(), 1000);
+      // 中控會自動重新分配失敗的分片
     }
   }
 
@@ -513,7 +513,7 @@ class P2PDownloader {
           file_id: fileId, chunk_index: chunkIndex, source_peer: sourcePeer
         });
       }
-      setTimeout(() => this._requestNextChunks(), 500);
+      // 在新模式下，中控會自動重新分配，無需主動重試
       return;
     }
 
@@ -548,7 +548,10 @@ class P2PDownloader {
 
     this.log(`區塊 ${chunkIndex}/${dl.totalChunks} 完成 ✓ (${dl.ownedChunks.size}/${dl.totalChunks})`);
     this._notifyStateChange();
-    this._requestNextChunks();
+
+    // 通知中控新的完成狀態，觸發配對掃描
+    // 中控會自動分配下一個任務
+    this._requestNextChunks(); // 只用於檢查完成狀態
   }
 
   async _finalizeDownload() {
