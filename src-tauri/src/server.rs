@@ -78,6 +78,28 @@ pub enum ClientMessage {
         chunk_index: u32,
         source_peer: String,
     },
+
+    /// 開始傳輸通知（上傳或下載）
+    #[serde(rename = "transfer_started")]
+    TransferStarted {
+        endpoint_id: String,
+        #[allow(dead_code)]
+        file_id: String,
+        #[allow(dead_code)]
+        chunk_index: u32,
+        is_upload: bool,
+    },
+
+    /// 傳輸完成通知（上傳或下載）
+    #[serde(rename = "transfer_finished")]
+    TransferFinished {
+        endpoint_id: String,
+        #[allow(dead_code)]
+        file_id: String,
+        #[allow(dead_code)]
+        chunk_index: u32,
+        is_upload: bool,
+    },
 }
 
 /// 伺服器 → 客戶端的訊息
@@ -377,6 +399,36 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
                     });
                 }
             }
+
+            ClientMessage::TransferStarted {
+                endpoint_id: eid,
+                is_upload,
+                ..
+            } => {
+                let mut s = state.p2p_state.write().await;
+                if let Some(ep) = s.endpoints.get_mut(&eid) {
+                    if is_upload {
+                        ep.upload_count += 1;
+                    } else {
+                        ep.download_count += 1;
+                    }
+                }
+            }
+
+            ClientMessage::TransferFinished {
+                endpoint_id: eid,
+                is_upload,
+                ..
+            } => {
+                let mut s = state.p2p_state.write().await;
+                if let Some(ep) = s.endpoints.get_mut(&eid) {
+                    if is_upload {
+                        ep.upload_count = ep.upload_count.saturating_sub(1);
+                    } else {
+                        ep.download_count = ep.download_count.saturating_sub(1);
+                    }
+                }
+            }
         }
     }
 
@@ -428,8 +480,9 @@ async fn handle_request_chunk(
     candidates.sort_by_key(|(_id, upload_count)| *upload_count);
 
     // 最大同時上傳連線數限制
-    const MAX_UPLOAD_CONNECTIONS: u32 = 5;
+    const MAX_UPLOAD_CONNECTIONS: u32 = 2;
 
+    // 優先尋找目前沒有上傳中的端點
     if let Some((peer_id, upload_count)) = candidates.first() {
         if *upload_count < MAX_UPLOAD_CONNECTIONS {
             let _ = requester_tx.send(ServerMessage::SuggestPeer {

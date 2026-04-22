@@ -304,6 +304,7 @@ class P2PDownloader {
   async _downloadChunkViaHttp(fileId, chunkIndex) {
     this.downloadCount++;
     this._notifyStateChange();
+    this._send({ type: 'transfer_started', endpoint_id: this.endpointId, file_id: fileId, chunk_index: chunkIndex, is_upload: false });
     try {
       const resp = await fetch(`/api/chunks/${fileId}/${chunkIndex}`);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -316,6 +317,7 @@ class P2PDownloader {
     } finally {
       this.downloadCount--;
       this._notifyStateChange();
+      this._send({ type: 'transfer_finished', endpoint_id: this.endpointId, file_id: fileId, chunk_index: chunkIndex, is_upload: false });
     }
   }
 
@@ -323,6 +325,7 @@ class P2PDownloader {
   async _downloadChunkViaWebRTC(fileId, chunkIndex, peerId) {
     this.downloadCount++;
     this._notifyStateChange();
+    this._send({ type: 'transfer_started', endpoint_id: this.endpointId, file_id: fileId, chunk_index: chunkIndex, is_upload: false });
     try {
       const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
       const dc = pc.createDataChannel(`chunk-${fileId}-${chunkIndex}`, { ordered: true });
@@ -337,6 +340,7 @@ class P2PDownloader {
           if (ctrl.type === 'chunk_complete') {
             const fullData = this._concatArrayBuffers(received, totalReceived);
             this._onChunkReceived(fileId, chunkIndex, fullData, peerId);
+            this._send({ type: 'transfer_finished', endpoint_id: this.endpointId, file_id: fileId, chunk_index: chunkIndex, is_upload: false });
           }
           return;
         }
@@ -375,6 +379,7 @@ class P2PDownloader {
           this.pendingRequests.delete(chunkIndex);
           this.downloadCount--;
           this._notifyStateChange();
+          this._send({ type: 'transfer_finished', endpoint_id: this.endpointId, file_id: fileId, chunk_index: chunkIndex, is_upload: false });
           this._requestNextChunks();
         }
       }, 30000);
@@ -415,6 +420,7 @@ class P2PDownloader {
 
     this.uploadCount++;
     this._notifyStateChange();
+    this._send({ type: 'transfer_started', endpoint_id: this.endpointId, file_id, chunk_index, is_upload: true });
 
     const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
 
@@ -430,7 +436,9 @@ class P2PDownloader {
     pc.ondatachannel = (e) => {
       const dc = e.channel;
       dc.binaryType = 'arraybuffer';
-      dc.onopen = () => this._sendChunkData(dc, file_id, chunk_index, from);
+      dc.onopen = () => {
+        this._sendChunkData(dc, file_id, chunk_index, from);
+      };
       dc.onmessage = (ev) => {
         if (typeof ev.data === 'string') {
           const ctrl = JSON.parse(ev.data);
@@ -443,6 +451,7 @@ class P2PDownloader {
       dc.onclose = () => {
         this.uploadCount--;
         this._notifyStateChange();
+        this._send({ type: 'transfer_finished', endpoint_id: this.endpointId, file_id, chunk_index, is_upload: true });
         pc.close();
       };
     };
