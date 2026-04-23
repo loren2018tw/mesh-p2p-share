@@ -596,103 +596,160 @@ pub async fn send_file_chunks_info(state: &ServerState, endpoint_id: &str, file_
     }
 }
 
-/// 核心配對邏輯：尋找並分配下載任務
-/// 實施「1 上傳 / 1 下載」的限制，確保端點不被重複分配
+/// 核心配對邏輯：以片段為中心的稀缺性優先配對
+/// 演算法：
+///   1. 對每個共享檔案，計算每個片段目前被多少端點持有（持有者數越少 = 越稀缺）
+///   2. 依持有者數量升冪排序片段（最稀缺優先）
+///   3. 逐一嘗試為每個片段找到合適的（來源端, 下載端）配對：
+///      - 下載端：缺少此片段且下載容量未滿，若多個則優先選進度最落後者（持有片段最少）
+///      - 來源端：持有此片段且上傳容量未滿，若多個則優先選上傳負載最低者
+///   4. 找到配對即完成指派；否則移至下一個片段
+///   5. 每個片段在同一輪最多只分配一次（assigned_this_round 防重複）
+///   6. 每個端點在同一輪最多只作為下載端或來源端一次（防止瞬間超過連線限制）
 async fn find_and_assign_matches(state: &ServerState) {
-    // 最大同時上傳連線數限制
     const MAX_UPLOAD_CONNECTIONS: u32 = 1;
     const MAX_DOWNLOAD_CONNECTIONS: u32 = 1;
 
     let s = state.p2p_state.read().await;
-    let senders = state.ws_senders.read().await;
-    drop(senders); // 先 drop，等待時再鎖定
 
-    // 收集所有需要下載的端點及其缺少的分片
-    let mut download_needs: Vec<(String, String, Vec<u32>)> = Vec::new();
+    // 本輪所有待發送的指派：(downloader_id, file_id, chunk_idx, source_id, owner_count, downloader_owned)
+    let mut to_assign: Vec<(String, String, u32, String, u32, u32)> = Vec::new();
 
-    for (endpoint_id, ep) in &s.endpoints {
-        // 跳過已達下載上限的端點
-        if ep.download_count >= MAX_DOWNLOAD_CONNECTIONS {
-            continue;
-        }
+    // 追蹤本輪已分配的片段（防止同一片段在一輪內分配給多個端點）
+    let mut assigned_chunks: HashMap<String, HashSet<u32>> = HashMap::new();
+    // 追蹤本輪已被選為下載端的端點（防止同一端點在一輪內被分配多個片段）
+    let mut assigned_downloaders: HashSet<String> = HashSet::new();
+    // 追蹤本輪已被選為來源端的端點（防止超過上傳容量限制）
+    let mut assigned_sources: HashSet<String> = HashSet::new();
 
-        // 遍歷所有檔案，找出缺少的分片
-        for (file_id, owned_chunks) in &ep.owned_chunks {
-            // 找到該檔案的元資訊
-            if let Some(file_info) = s.shared_files.iter().find(|f| &f.file_id == file_id) {
-                let missing: Vec<u32> = (0..file_info.chunk_count)
-                    .filter(|idx| !owned_chunks.contains(idx))
-                    .collect();
+    for file_info in &s.shared_files {
+        let file_id = &file_info.file_id;
+        let chunk_count = file_info.chunk_count;
 
-                if !missing.is_empty() {
-                    download_needs.push((endpoint_id.clone(), file_id.clone(), missing));
-                }
+        // Task 1.1: 計算每個片段的持有者數量
+        let mut rarity: Vec<(u32, u32)> = (0..chunk_count)
+            .map(|chunk_idx| {
+                let owner_count = s
+                    .endpoints
+                    .values()
+                    .filter(|ep| {
+                        ep.owned_chunks
+                            .get(file_id)
+                            .map_or(false, |chunks| chunks.contains(&chunk_idx))
+                    })
+                    .count() as u32;
+                (chunk_idx, owner_count)
+            })
+            .collect();
+
+        // Task 1.2: 依持有者數量升冪排序（最稀缺優先）
+        rarity.sort_by_key(|(_, count)| *count);
+
+        let file_chunks_assigned = assigned_chunks.entry(file_id.clone()).or_default();
+
+        // Task 2.1: 以片段為中心的外層迴圈
+        'chunk_loop: for (chunk_idx, owner_count) in &rarity {
+            let chunk_idx = *chunk_idx;
+            let owner_count = *owner_count;
+
+            // 跳過本輪已分配的片段
+            if file_chunks_assigned.contains(&chunk_idx) {
+                continue;
             }
+
+            // Task 2.2: 找下載端候選 — 缺少此片段、下載容量未滿、本輪尚未被分配
+            let mut downloader_candidates: Vec<(&String, u32)> = s
+                .endpoints
+                .iter()
+                .filter(|(id, ep)| {
+                    !assigned_downloaders.contains(*id)
+                        && ep.download_count < MAX_DOWNLOAD_CONNECTIONS
+                        && !ep
+                            .owned_chunks
+                            .get(file_id)
+                            .map_or(false, |chunks| chunks.contains(&chunk_idx))
+                })
+                .map(|(id, ep)| {
+                    // 下載端持有片段數（進度指標）
+                    let owned_count = ep.owned_chunks.get(file_id).map_or(0, |c| c.len() as u32);
+                    (id, owned_count)
+                })
+                .collect();
+
+            if downloader_candidates.is_empty() {
+                continue 'chunk_loop;
+            }
+
+            // 優先選進度最落後者（持有片段最少）
+            downloader_candidates.sort_by_key(|(_, owned)| *owned);
+            let (downloader_id, downloader_owned) = downloader_candidates[0];
+
+            // Task 2.3: 找來源端候選 — 持有此片段、上傳容量未滿、本輪尚未被分配、非下載端本身
+            let mut source_candidates: Vec<(&String, u32)> = s
+                .endpoints
+                .iter()
+                .filter(|(id, ep)| {
+                    *id != downloader_id
+                        && !assigned_sources.contains(*id)
+                        && ep.upload_count < MAX_UPLOAD_CONNECTIONS
+                        && ep
+                            .owned_chunks
+                            .get(file_id)
+                            .map_or(false, |chunks| chunks.contains(&chunk_idx))
+                })
+                .map(|(id, ep)| (id, ep.upload_count))
+                .collect();
+
+            if source_candidates.is_empty() {
+                continue 'chunk_loop;
+            }
+
+            // 優先選上傳負載最低者
+            source_candidates.sort_by_key(|(_, upload_count)| *upload_count);
+            let (source_id, _) = source_candidates[0];
+
+            // Task 2.4: 完成指派，記錄至防重複集合
+            let downloader_id = downloader_id.clone();
+            let source_id = source_id.clone();
+
+            file_chunks_assigned.insert(chunk_idx);
+            assigned_downloaders.insert(downloader_id.clone());
+            assigned_sources.insert(source_id.clone());
+
+            // Task 1.3: 記錄配對日誌（片段索引、稀缺度、下載端持有量）
+            println!(
+                "[配對] 檔案={} 片段={} 稀缺度={} 下載端持有={} | {} ← {}",
+                &file_id[..8.min(file_id.len())],
+                chunk_idx,
+                owner_count,
+                downloader_owned,
+                &downloader_id[..8.min(downloader_id.len())],
+                &source_id[..8.min(source_id.len())]
+            );
+
+            to_assign.push((
+                downloader_id,
+                file_id.clone(),
+                chunk_idx,
+                source_id,
+                owner_count,
+                downloader_owned,
+            ));
         }
     }
 
-    drop(s); // 釋放讀鎖
+    drop(s);
 
-    // 追蹤本輪已分配的 chunk_index（按 file_id 索引），確保不同下載端拿到不同分片。
-    // 此結構於每次呼叫 find_and_assign_matches 時建立，函數返回後即釋放，不會累積。
-    let mut assigned_this_round: HashMap<String, HashSet<u32>> = HashMap::new();
-
-    // 對每個下載需求進行配對
-    for (downloader_id, file_id, missing_chunks) in download_needs {
-        let s = state.p2p_state.read().await;
-
-        // 從缺少的分片中，找一個本輪尚未被分配給其他端點的分片
-        let already_assigned = assigned_this_round.get(&file_id);
-        let chunk_idx = missing_chunks
-            .iter()
-            .find(|idx| !already_assigned.map_or(false, |s| s.contains(*idx)));
-
-        let chunk_idx = match chunk_idx {
-            Some(idx) => *idx,
-            None => continue, // 所有缺少的分片本輪都已被分配，跳過
-        };
-
-        // 尋找擁有該分片的候選源端點
-        let mut candidates: Vec<(String, u32)> = Vec::new();
-        for (peer_id, ep) in &s.endpoints {
-            // 跳過請求端本身
-            if peer_id == &downloader_id {
-                continue;
-            }
-
-            // 檢查是否擁有該分片
-            if !ep
-                .owned_chunks
-                .get(&file_id)
-                .map_or(false, |chunks| chunks.contains(&chunk_idx))
-            {
-                continue;
-            }
-
-            // 檢查上傳限制
-            if ep.upload_count >= MAX_UPLOAD_CONNECTIONS {
-                continue;
-            }
-
-            candidates.push((peer_id.clone(), ep.upload_count));
-        }
-
-        drop(s);
-
-        // 若有可用來源，發送分配指令
-        if let Some((source_peer, _)) = candidates.into_iter().min_by_key(|(_, count)| *count) {
-            let senders = state.ws_senders.read().await;
-            if let Some(tx) = senders.get(&downloader_id) {
-                let _ = tx.send(ServerMessage::SuggestDownload {
-                    file_id: file_id.clone(),
-                    chunk_index: chunk_idx,
-                    source_peer,
-                });
-                assigned_this_round
-                    .entry(file_id)
-                    .or_insert_with(HashSet::new)
-                    .insert(chunk_idx);
-            }
+    // 發送所有指派訊息
+    let senders = state.ws_senders.read().await;
+    for (downloader_id, file_id, chunk_idx, source_id, _owner_count, _downloader_owned) in to_assign
+    {
+        if let Some(tx) = senders.get(&downloader_id) {
+            let _ = tx.send(ServerMessage::SuggestDownload {
+                file_id,
+                chunk_index: chunk_idx,
+                source_peer: source_id,
+            });
         }
     }
 }

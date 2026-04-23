@@ -1,10 +1,4 @@
-# centralized-peer-matching Specification
-
-## Purpose
-
-TBD - created by archiving change centralized-peer-matching. Update Purpose after archive.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Centralized Assignment Control
 
@@ -29,21 +23,3 @@ TBD - created by archiving change centralized-peer-matching. Update Purpose afte
 
 - **WHEN** 持有者最少的片段找不到同時滿足上傳與下載容量的端點配對
 - **THEN** 中控端 SHALL 跳過此片段，對持有者次少的片段重複嘗試，直到所有片段都已嘗試。
-
-### Requirement: Concurrency Constraints
-
-每個端點 SHALL 同時只能處理一個上傳與一個下載任務。
-
-#### Scenario: Busy Peer Skipping
-
-- **WHEN** 中控端配對時，發現符合條件的來源端點 B 已經有一個進行中的上傳任務
-- **THEN** 配對邏輯跳過端點 B，直到其回報任務完成或掃描下一個端點
-
-### Requirement: Event-Driven Re-matching
-
-配對邏輯 SHALL 在關鍵事件發生時即時反應。
-
-#### Scenario: Re-match on Completion
-
-- **WHEN** 端點 A 完成一個分片的下載並回報 `chunk_completed`
-- **THEN** 中控端立即更新該端點的擁有狀態，並針對缺片端點重新執行配對掃描
