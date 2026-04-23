@@ -115,7 +115,10 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     /// 註冊成功
     #[serde(rename = "registered")]
-    Registered { endpoint_id: String },
+    Registered {
+        endpoint_id: String,
+        host_endpoint_id: String,
+    },
 
     /// 檔案清單
     #[serde(rename = "file_list")]
@@ -192,6 +195,8 @@ pub struct ServerState {
     pub p2p_state: SharedState,
     /// 各端點的 WebSocket 發送通道 (key = endpoint_id)
     pub ws_senders: crate::WsSenders,
+    /// 目前執行檔的版本資訊
+    pub app_version: String,
 }
 
 /// HTTP API：取得檔案清單
@@ -211,8 +216,8 @@ async fn get_file_list(AxumState(state): AxumState<ServerState>) -> impl IntoRes
 }
 
 /// HTTP API：取得程式版本
-async fn get_version() -> impl IntoResponse {
-    env!("CARGO_PKG_VERSION")
+async fn get_version(AxumState(state): AxumState<ServerState>) -> impl IntoResponse {
+    state.app_version
 }
 
 /// HTTP API：Host 作為種子時，提供區塊資料下載
@@ -328,9 +333,14 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
                         });
                 }
 
-                // 回傳註冊成功
+                // 回傳註冊成功（含 host endpoint ID，讓下載端知道要向誰做 HTTP 下載）
+                let host_endpoint_id = {
+                    let s = state.p2p_state.read().await;
+                    s.host_endpoint_id.clone()
+                };
                 let _ = tx.send(ServerMessage::Registered {
                     endpoint_id: eid.clone(),
+                    host_endpoint_id,
                 });
 
                 // 發送檔案清單
@@ -623,49 +633,65 @@ async fn find_and_assign_matches(state: &ServerState) {
 
     drop(s); // 釋放讀鎖
 
+    // 追蹤本輪已分配的 chunk_index（按 file_id 索引），確保不同下載端拿到不同分片。
+    // 此結構於每次呼叫 find_and_assign_matches 時建立，函數返回後即釋放，不會累積。
+    let mut assigned_this_round: HashMap<String, HashSet<u32>> = HashMap::new();
+
     // 對每個下載需求進行配對
     for (downloader_id, file_id, missing_chunks) in download_needs {
-        // 只嘗試分配一個分片，避免過度配對
-        if let Some(chunk_idx) = missing_chunks.first() {
-            let s = state.p2p_state.read().await;
+        let s = state.p2p_state.read().await;
 
-            // 尋找擁有該分片的候選源端點
-            let mut candidates: Vec<(String, u32)> = Vec::new();
-            for (peer_id, ep) in &s.endpoints {
-                // 跳過請求端本身
-                if peer_id == &downloader_id {
-                    continue;
-                }
+        // 從缺少的分片中，找一個本輪尚未被分配給其他端點的分片
+        let already_assigned = assigned_this_round.get(&file_id);
+        let chunk_idx = missing_chunks
+            .iter()
+            .find(|idx| !already_assigned.map_or(false, |s| s.contains(*idx)));
 
-                // 檢查是否擁有該分片
-                if !ep
-                    .owned_chunks
-                    .get(&file_id)
-                    .map_or(false, |chunks| chunks.contains(chunk_idx))
-                {
-                    continue;
-                }
+        let chunk_idx = match chunk_idx {
+            Some(idx) => *idx,
+            None => continue, // 所有缺少的分片本輪都已被分配，跳過
+        };
 
-                // 檢查上傳限制
-                if ep.upload_count >= MAX_UPLOAD_CONNECTIONS {
-                    continue;
-                }
-
-                candidates.push((peer_id.clone(), ep.upload_count));
+        // 尋找擁有該分片的候選源端點
+        let mut candidates: Vec<(String, u32)> = Vec::new();
+        for (peer_id, ep) in &s.endpoints {
+            // 跳過請求端本身
+            if peer_id == &downloader_id {
+                continue;
             }
 
-            drop(s);
+            // 檢查是否擁有該分片
+            if !ep
+                .owned_chunks
+                .get(&file_id)
+                .map_or(false, |chunks| chunks.contains(&chunk_idx))
+            {
+                continue;
+            }
 
-            // 若有可用來源，發送分配指令
-            if let Some((source_peer, _)) = candidates.into_iter().min_by_key(|(_, count)| *count) {
-                let senders = state.ws_senders.read().await;
-                if let Some(tx) = senders.get(&downloader_id) {
-                    let _ = tx.send(ServerMessage::SuggestDownload {
-                        file_id,
-                        chunk_index: *chunk_idx,
-                        source_peer,
-                    });
-                }
+            // 檢查上傳限制
+            if ep.upload_count >= MAX_UPLOAD_CONNECTIONS {
+                continue;
+            }
+
+            candidates.push((peer_id.clone(), ep.upload_count));
+        }
+
+        drop(s);
+
+        // 若有可用來源，發送分配指令
+        if let Some((source_peer, _)) = candidates.into_iter().min_by_key(|(_, count)| *count) {
+            let senders = state.ws_senders.read().await;
+            if let Some(tx) = senders.get(&downloader_id) {
+                let _ = tx.send(ServerMessage::SuggestDownload {
+                    file_id: file_id.clone(),
+                    chunk_index: chunk_idx,
+                    source_peer,
+                });
+                assigned_this_round
+                    .entry(file_id)
+                    .or_insert_with(HashSet::new)
+                    .insert(chunk_idx);
             }
         }
     }
@@ -677,9 +703,12 @@ pub async fn run_server(
     p2p_state: SharedState,
     ws_senders: crate::WsSenders,
 ) {
+    let app_version = app_handle.package_info().version.to_string();
+
     let server_state = ServerState {
         p2p_state,
         ws_senders,
+        app_version,
     };
 
     use tauri::Manager;

@@ -164,7 +164,10 @@ pub fn process_file(file_path: &str) -> Result<SharedFileInfo, String> {
 }
 
 /// 將檔案加入分享狀態
-pub async fn add_shared_file(state: &SharedState, file_path: &str) -> Result<SharedFileInfo, String> {
+pub async fn add_shared_file(
+    state: &SharedState,
+    file_path: &str,
+) -> Result<SharedFileInfo, String> {
     let info = process_file(file_path)?;
     let mut s = state.write().await;
 
@@ -221,8 +224,7 @@ pub async fn read_chunk_data(
     // 在 blocking thread 中讀取檔案
     tokio::task::spawn_blocking(move || {
         use std::io::{Read, Seek, SeekFrom};
-        let mut file = std::fs::File::open(&file_path)
-            .map_err(|e| format!("無法開啟檔案: {e}"))?;
+        let mut file = std::fs::File::open(&file_path).map_err(|e| format!("無法開啟檔案: {e}"))?;
         file.seek(SeekFrom::Start(offset))
             .map_err(|e| format!("無法定位: {e}"))?;
         let mut buf = vec![0u8; size as usize];

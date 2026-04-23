@@ -76,8 +76,8 @@ async fn remove_shared_file(path: String, state: State<'_, AppState>) -> Result<
 }
 
 #[tauri::command]
-async fn get_app_version() -> Result<String, String> {
-    Ok(env!("CARGO_PKG_VERSION").to_string())
+async fn get_app_version(app: tauri::AppHandle) -> Result<String, String> {
+    Ok(app.package_info().version.to_string())
 }
 
 #[tauri::command]
