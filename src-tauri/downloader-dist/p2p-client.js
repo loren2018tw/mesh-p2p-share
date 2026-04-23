@@ -122,6 +122,7 @@ class P2PDownloader {
     switch (msg.type) {
       case 'registered':
         this.log(`註冊成功: ${msg.endpoint_id}`);
+        this.hostEndpointId = msg.host_endpoint_id || null;
         break;
       case 'file_list':
         this.files = msg.files;
