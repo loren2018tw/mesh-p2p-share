@@ -115,7 +115,10 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     /// 註冊成功
     #[serde(rename = "registered")]
-    Registered { endpoint_id: String, host_endpoint_id: String },
+    Registered {
+        endpoint_id: String,
+        host_endpoint_id: String,
+    },
 
     /// 檔案清單
     #[serde(rename = "file_list")]
@@ -192,6 +195,8 @@ pub struct ServerState {
     pub p2p_state: SharedState,
     /// 各端點的 WebSocket 發送通道 (key = endpoint_id)
     pub ws_senders: crate::WsSenders,
+    /// 目前執行檔的版本資訊
+    pub app_version: String,
 }
 
 /// HTTP API：取得檔案清單
@@ -211,8 +216,8 @@ async fn get_file_list(AxumState(state): AxumState<ServerState>) -> impl IntoRes
 }
 
 /// HTTP API：取得程式版本
-async fn get_version() -> impl IntoResponse {
-    env!("CARGO_PKG_VERSION")
+async fn get_version(AxumState(state): AxumState<ServerState>) -> impl IntoResponse {
+    state.app_version
 }
 
 /// HTTP API：Host 作為種子時，提供區塊資料下載
@@ -638,9 +643,9 @@ async fn find_and_assign_matches(state: &ServerState) {
 
         // 從缺少的分片中，找一個本輪尚未被分配給其他端點的分片
         let already_assigned = assigned_this_round.get(&file_id);
-        let chunk_idx = missing_chunks.iter().find(|idx| {
-            !already_assigned.map_or(false, |s| s.contains(*idx))
-        });
+        let chunk_idx = missing_chunks
+            .iter()
+            .find(|idx| !already_assigned.map_or(false, |s| s.contains(*idx)));
 
         let chunk_idx = match chunk_idx {
             Some(idx) => *idx,
@@ -683,7 +688,10 @@ async fn find_and_assign_matches(state: &ServerState) {
                     chunk_index: chunk_idx,
                     source_peer,
                 });
-                assigned_this_round.entry(file_id).or_insert_with(HashSet::new).insert(chunk_idx);
+                assigned_this_round
+                    .entry(file_id)
+                    .or_insert_with(HashSet::new)
+                    .insert(chunk_idx);
             }
         }
     }
@@ -695,9 +703,12 @@ pub async fn run_server(
     p2p_state: SharedState,
     ws_senders: crate::WsSenders,
 ) {
+    let app_version = app_handle.package_info().version.to_string();
+
     let server_state = ServerState {
         p2p_state,
         ws_senders,
+        app_version,
     };
 
     use tauri::Manager;

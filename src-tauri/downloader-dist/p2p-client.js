@@ -269,6 +269,7 @@ class P2PDownloader {
     const { file_id, chunk_index, source_peer } = msg;
     if (!this.activeDownload || this.activeDownload.fileId !== file_id) return;
     if (this.activeDownload.ownedChunks.has(chunk_index)) return; // 已擁有此分片
+    if (this.pendingRequests.has(chunk_index)) return; // 已在下載中，忽略重複指派
 
     this.log(`中控指令: 區塊 ${chunk_index} 來自 ${source_peer.slice(0, 8)}...`);
     this.pendingRequests.add(chunk_index);
@@ -381,6 +382,7 @@ class P2PDownloader {
           this.pendingRequests.delete(chunkIndex);
           this.downloadCount--;
           this._notifyStateChange();
+          this.log(`WebRTC 下載區塊 ${chunkIndex} 逾時（30 秒）: 來源端 ${peerId.slice(0, 8)} 未回應`);
           this._send({ type: 'transfer_finished', endpoint_id: this.endpointId, file_id: fileId, chunk_index: chunkIndex, is_upload: false });
         }
       }, 30000);
@@ -417,11 +419,16 @@ class P2PDownloader {
 
   async _handleIncomingOffer(from, signal) {
     const { file_id, chunk_index, sdp } = signal;
-    if (!this.activeDownload || !this.activeDownload.ownedChunks.has(chunk_index)) return;
+    const hasChunk = this.chunkBuffers.get(file_id)?.has(chunk_index)
+      || (this.activeDownload
+        && this.activeDownload.fileId === file_id
+        && this.activeDownload.ownedChunks.has(chunk_index));
+    if (!hasChunk) return;
 
     this.uploadCount++;
     this._notifyStateChange();
     this._send({ type: 'transfer_started', endpoint_id: this.endpointId, file_id, chunk_index, is_upload: true });
+    this.log(`上傳區塊 ${chunk_index} 給端點 ${from.slice(0, 8)}...`);
 
     const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
 
@@ -453,6 +460,7 @@ class P2PDownloader {
         this.uploadCount--;
         this._notifyStateChange();
         this._send({ type: 'transfer_finished', endpoint_id: this.endpointId, file_id, chunk_index, is_upload: true });
+        this.log(`上傳區塊 ${chunk_index} 完成 ✓ → 端點 ${from.slice(0, 8)}...`);
         pc.close();
       };
     };
