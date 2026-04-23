@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, UdpSocket};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -107,6 +108,16 @@ pub enum ClientMessage {
         chunk_index: u32,
         is_upload: bool,
     },
+
+    /// 傳輸失敗通知（目前主要用於 WebRTC timeout）
+    #[serde(rename = "transfer_failed")]
+    TransferFailed {
+        endpoint_id: String,
+        file_id: String,
+        chunk_index: u32,
+        source_peer: String,
+        reason: String,
+    },
 }
 
 /// 伺服器 → 客戶端的訊息
@@ -197,6 +208,8 @@ pub struct ServerState {
     pub ws_senders: crate::WsSenders,
     /// 目前執行檔的版本資訊
     pub app_version: String,
+    /// 暫時不可用來源端點的冷卻截止時間
+    pub source_cooldown_until: Arc<TokioMutex<HashMap<String, Instant>>>,
 }
 
 /// HTTP API：取得檔案清單
@@ -502,6 +515,44 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
                         ep.download_count = ep.download_count.saturating_sub(1);
                     }
                 }
+                drop(s);
+
+                // 下載任務結束後通常會釋放容量，立即重排
+                if !is_upload {
+                    find_and_assign_matches(&state).await;
+                }
+            }
+
+            ClientMessage::TransferFailed {
+                endpoint_id,
+                file_id,
+                chunk_index,
+                source_peer,
+                reason,
+            } => {
+                let host_id = {
+                    let s = state.p2p_state.read().await;
+                    s.host_endpoint_id.clone()
+                };
+
+                if !source_peer.is_empty() && source_peer != host_id {
+                    let mut cooldown = state.source_cooldown_until.lock().await;
+                    cooldown.insert(
+                        source_peer.clone(),
+                        Instant::now() + Duration::from_secs(20),
+                    );
+                }
+
+                println!(
+                    "[配對] 來源端點冷卻: src={} requester={} file={} chunk={} reason={}",
+                    &source_peer[..8.min(source_peer.len())],
+                    &endpoint_id[..8.min(endpoint_id.len())],
+                    &file_id[..8.min(file_id.len())],
+                    chunk_index,
+                    reason
+                );
+
+                find_and_assign_matches(&state).await;
             }
         }
     }
@@ -621,8 +672,8 @@ pub async fn send_file_chunks_info(state: &ServerState, endpoint_id: &str, file_
 /// 3. host 主要做補片，不讓大多數流量長時間集中在 host
 async fn find_and_assign_matches(state: &ServerState) {
     const MAX_UPLOAD_CONNECTIONS: u32 = 1;
-    const MAX_DOWNLOAD_CONNECTIONS: u32 = 1;
-    const PEER_FIRST_PERCENT: u32 = 70;
+    const MAX_DOWNLOAD_CONNECTIONS: u32 = 2;
+    const PEER_FIRST_PERCENT: u32 = 85;
 
     #[derive(Clone)]
     struct Candidate {
@@ -633,7 +684,15 @@ async fn find_and_assign_matches(state: &ServerState) {
         owner_count: u32,
         downloader_owned: u32,
         source_upload: u32,
+        source_download: u32,
     }
+
+    let now = Instant::now();
+    let cooldown_snapshot: HashMap<String, Instant> = {
+        let mut cooldown = state.source_cooldown_until.lock().await;
+        cooldown.retain(|_, until| *until > now);
+        cooldown.clone()
+    };
 
     let s = state.p2p_state.read().await;
     let host_id = s.host_endpoint_id.clone();
@@ -702,18 +761,22 @@ async fn find_and_assign_matches(state: &ServerState) {
             let (downloader_id, downloader_owned) = downloader_candidates[0];
 
             // 來源端候選：持有此片段、上傳容量未滿、非下載端本身
-            let source_candidates: Vec<(&String, u32)> = s
+            let source_candidates: Vec<(&String, u32, u32)> = s
                 .endpoints
                 .iter()
                 .filter(|(id, ep)| {
                     *id != downloader_id
                         && ep.upload_count < MAX_UPLOAD_CONNECTIONS
+                        && (id.as_str() == host_id
+                            || !cooldown_snapshot
+                                .get(id.as_str())
+                                .map_or(false, |until| *until > now))
                         && ep
                             .owned_chunks
                             .get(file_id)
                             .map_or(false, |chunks| chunks.contains(&chunk_idx))
                 })
-                .map(|(id, ep)| (id, ep.upload_count))
+                .map(|(id, ep)| (id, ep.upload_count, ep.download_count))
                 .collect();
 
             if source_candidates.is_empty() {
@@ -721,29 +784,31 @@ async fn find_and_assign_matches(state: &ServerState) {
             }
 
             // 來源拆成 peer / host 兩池，優先協同
-            let mut peer_sources: Vec<(&String, u32)> = source_candidates
+            let mut peer_sources: Vec<(&String, u32, u32)> = source_candidates
                 .iter()
                 .copied()
-                .filter(|(id, _)| *id != &host_id)
+                .filter(|(id, _, _)| *id != &host_id)
                 .collect();
-            peer_sources.sort_by_key(|(_, upload_count)| *upload_count);
+            peer_sources
+                .sort_by_key(|(_, upload_count, download_count)| (*upload_count, *download_count));
 
-            let mut host_sources: Vec<(&String, u32)> = source_candidates
+            let mut host_sources: Vec<(&String, u32, u32)> = source_candidates
                 .iter()
                 .copied()
-                .filter(|(id, _)| *id == &host_id)
+                .filter(|(id, _, _)| *id == &host_id)
                 .collect();
-            host_sources.sort_by_key(|(_, upload_count)| *upload_count);
+            host_sources
+                .sort_by_key(|(_, upload_count, download_count)| (*upload_count, *download_count));
 
-            let chosen = if let Some((src, up)) = peer_sources.first() {
-                Some(((*src).clone(), *up, true))
-            } else if let Some((src, up)) = host_sources.first() {
-                Some(((*src).clone(), *up, false))
+            let chosen = if let Some((src, up, down)) = peer_sources.first() {
+                Some(((*src).clone(), *up, *down, true))
+            } else if let Some((src, up, down)) = host_sources.first() {
+                Some(((*src).clone(), *up, *down, false))
             } else {
                 None
             };
 
-            let Some((source_id, source_upload, from_peer_pool)) = chosen else {
+            let Some((source_id, source_upload, source_download, from_peer_pool)) = chosen else {
                 continue 'chunk_loop;
             };
 
@@ -757,6 +822,7 @@ async fn find_and_assign_matches(state: &ServerState) {
                 owner_count,
                 downloader_owned,
                 source_upload,
+                source_download,
             };
 
             if from_peer_pool {
@@ -773,6 +839,7 @@ async fn find_and_assign_matches(state: &ServerState) {
             c.owner_count,
             c.downloader_owned,
             c.source_upload,
+            c.source_download,
             c.chunk_idx,
         )
     });
@@ -781,6 +848,7 @@ async fn find_and_assign_matches(state: &ServerState) {
             c.owner_count,
             c.downloader_owned,
             c.source_upload,
+            c.source_download,
             c.chunk_idx,
         )
     });
@@ -868,6 +936,17 @@ async fn find_and_assign_matches(state: &ServerState) {
         );
     }
 
+    let peer_assigned = to_assign.iter().filter(|c| c.source_id != host_id).count();
+    let host_assigned = to_assign.len().saturating_sub(peer_assigned);
+    println!(
+        "[配對統計] 本輪指派 peer={} host={} total={} target_peer={} capacity={}",
+        peer_assigned,
+        host_assigned,
+        to_assign.len(),
+        peer_target,
+        max_assignments
+    );
+
     drop(s);
 
     // 發送所有指派訊息
@@ -904,6 +983,7 @@ pub async fn run_server(
         p2p_state,
         ws_senders,
         app_version,
+        source_cooldown_until: Arc::new(TokioMutex::new(HashMap::new())),
     };
 
     use tauri::Manager;

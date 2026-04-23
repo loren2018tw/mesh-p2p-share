@@ -383,11 +383,27 @@ class P2PDownloader {
           this.downloadCount--;
           this._notifyStateChange();
           this.log(`WebRTC 下載區塊 ${chunkIndex} 逾時（30 秒）: 來源端 ${peerId.slice(0, 8)} 未回應`);
+          this._send({
+            type: 'transfer_failed',
+            endpoint_id: this.endpointId,
+            file_id: fileId,
+            chunk_index: chunkIndex,
+            source_peer: peerId,
+            reason: 'timeout'
+          });
           this._send({ type: 'transfer_finished', endpoint_id: this.endpointId, file_id: fileId, chunk_index: chunkIndex, is_upload: false });
         }
       }, 30000);
     } catch (e) {
       this.log(`WebRTC 下載區塊 ${chunkIndex} 失敗: ${e.message}`);
+      this._send({
+        type: 'transfer_failed',
+        endpoint_id: this.endpointId,
+        file_id: fileId,
+        chunk_index: chunkIndex,
+        source_peer: peerId,
+        reason: `exception:${e.message}`
+      });
       this.downloadCount--;
       this.pendingRequests.delete(chunkIndex);
       this._notifyStateChange();
