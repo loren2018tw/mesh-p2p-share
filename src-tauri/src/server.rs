@@ -756,16 +756,16 @@ async fn host_http_dispatch(state: &ServerState) {
 
         // Host HTTP 同時間僅允許一個下載端執行，若已有任務則本輪不再派發。
         if !s.http_assignments.is_empty() {
-            if let Some((ep_id, assignment)) = s.http_assignments.iter().next() {
-                println!(
-                    "[HTTP分派統計] 略過新指派: in_flight={} endpoint={} file={} chunk={} started={}",
-                    s.http_assignments.len(),
-                    &ep_id[..8.min(ep_id.len())],
-                    &assignment.file_id[..8.min(assignment.file_id.len())],
-                    assignment.chunk_index,
-                    assignment.started
-                );
-            }
+            // if let Some((ep_id, assignment)) = s.http_assignments.iter().next() {
+            // println!(
+            //     "[HTTP分派統計] 略過新指派: in_flight={} endpoint={} file={} chunk={} started={}",
+            //     s.http_assignments.len(),
+            //     &ep_id[..8.min(ep_id.len())],
+            //     &assignment.file_id[..8.min(assignment.file_id.len())],
+            //     assignment.chunk_index,
+            //     assignment.started
+            // );
+            // }
             return;
         }
 
@@ -780,6 +780,7 @@ async fn host_http_dispatch(state: &ServerState) {
             .iter()
             .map(|f| (f.file_id.clone(), f.chunk_count))
             .collect();
+
         let mut assigned_one = false;
 
         for file_id in &file_ids {
@@ -788,7 +789,7 @@ async fn host_http_dispatch(state: &ServerState) {
                 _ => continue,
             };
 
-            // 取得正在下載此檔案的瀏覽器端點，按 ID 排序確保穩定順序
+            // 1. 取得正在下載此檔案且缺片的端點
             let mut active_downloaders: Vec<(String, HashSet<u32>)> = s
                 .endpoints
                 .iter()
@@ -811,44 +812,40 @@ async fn host_http_dispatch(state: &ServerState) {
                 continue;
             }
 
+            // 按 ID 排序確保穩定順序，以便輪轉
             active_downloaders.sort_by(|a, b| a.0.cmp(&b.0));
 
+            // 2. 決定下一個該獲得分派的端點 (Round-robin 端點)
+            let last_ep = s.file_last_http_endpoint.get(file_id);
+            let start_idx = if let Some(last_id) = last_ep {
+                active_downloaders
+                    .iter()
+                    .position(|(id, _)| id == last_id)
+                    .map(|pos| (pos + 1) % active_downloaders.len())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
+            // 3. 從目標端點出發，尋找該端點最需要的片段 (優先參考檔案游標)
             let cursor = *s.file_chunk_cursors.entry(file_id.clone()).or_insert(0);
-            let mut cur = cursor;
-            let old_cur = cur;
-            let last_endpoint = s.file_last_http_endpoint.get(file_id).cloned();
 
-            // 依序掃描端點，從游標往後找第一個缺片再分配
-            // 若候選超過 1 個，先跑非「上次指派端點」再回補，避免連續指派到同端點。
-            for pass in 0..2 {
-                for (ep_id, owned) in &active_downloaders {
-                    let is_last_endpoint = last_endpoint.as_deref() == Some(ep_id.as_str());
-                    if active_downloaders.len() > 1 {
-                        if pass == 0 && is_last_endpoint {
-                            continue;
-                        }
-                        if pass == 1 && !is_last_endpoint {
-                            continue;
-                        }
-                    } else if pass == 1 {
-                        continue;
+            for i in 0..active_downloaders.len() {
+                let target_idx = (start_idx + i) % active_downloaders.len();
+                let (ep_id, owned) = &active_downloaders[target_idx];
+
+                let mut selected_chunk: Option<u32> = None;
+                // 從游標開始，找第一個該端點還沒有的片段
+                for offset in 0..chunk_count {
+                    let candidate = (cursor + offset) % chunk_count;
+                    if !owned.contains(&candidate) {
+                        selected_chunk = Some(candidate);
+                        break;
                     }
+                }
 
-                    let mut selected_chunk: Option<u32> = None;
-                    for offset in 0..chunk_count {
-                        let candidate = (cur + offset) % chunk_count;
-                        if !owned.contains(&candidate) {
-                            selected_chunk = Some(candidate);
-                            break;
-                        }
-                    }
-
-                    let Some(chunk_idx) = selected_chunk else {
-                        // 此端點已無缺片，不需要再派 HTTP。
-                        continue;
-                    };
-
-                    // 此端點找到缺片，分配並以前進到下一片為新游標。
+                if let Some(chunk_idx) = selected_chunk {
+                    // 執行指派
                     to_assign.push((ep_id.clone(), file_id.clone(), chunk_idx));
                     s.file_last_http_endpoint
                         .insert(file_id.clone(), ep_id.clone());
@@ -861,22 +858,15 @@ async fn host_http_dispatch(state: &ServerState) {
                             assigned_at: now,
                         },
                     );
-                    cur = (chunk_idx + 1) % chunk_count;
+
+                    // 更新檔案游標：下一次從這片之後開始找，增加片段多樣性
+                    s.file_chunk_cursors
+                        .insert(file_id.clone(), (chunk_idx + 1) % chunk_count);
+
                     assigned_one = true;
                     break;
                 }
-
-                if assigned_one {
-                    break;
-                }
             }
-
-            // 若游標完全未前進（所有端點都已有此片段），強制推進一格避免卡住
-            if cur == old_cur {
-                cur = (cur + 1) % chunk_count;
-            }
-
-            s.file_chunk_cursors.insert(file_id.clone(), cur);
 
             if assigned_one {
                 break;
