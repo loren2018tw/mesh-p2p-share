@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 
 /// 50 MB per chunk
@@ -53,6 +54,19 @@ pub struct EndpointState {
     pub download_count: u32,
 }
 
+/// Host HTTP 指派狀態（每個端點同時最多一個）
+#[derive(Debug, Clone)]
+pub struct HttpChunkAssignment {
+    /// 被指派下載的檔案
+    pub file_id: String,
+    /// 被指派下載的區塊
+    pub chunk_index: u32,
+    /// 是否已經開始實際 HTTP 請求
+    pub started: bool,
+    /// 指派時間（用於清除過期保留）
+    pub assigned_at: Instant,
+}
+
 /// 全域的分享狀態（由中控中心管理）
 pub type SharedState = Arc<RwLock<P2PState>>;
 
@@ -64,6 +78,12 @@ pub struct P2PState {
     pub endpoints: HashMap<String, EndpointState>,
     /// 分享端本身的 WebRTC 端點 ID
     pub host_endpoint_id: String,
+    /// Host HTTP 輪轉游標：key = file_id，value = 下次要分配的片段索引
+    pub file_chunk_cursors: HashMap<String, u32>,
+    /// Host HTTP 最近一次被指派端點：key = file_id，value = endpoint_id
+    pub file_last_http_endpoint: HashMap<String, String>,
+    /// Host HTTP 指派（key = endpoint_id），限制同端點同時只能一個 HTTP 下載
+    pub http_assignments: HashMap<String, HttpChunkAssignment>,
 }
 
 impl P2PState {
@@ -83,6 +103,9 @@ impl P2PState {
             shared_files: Vec::new(),
             endpoints,
             host_endpoint_id,
+            file_chunk_cursors: HashMap::new(),
+            file_last_http_endpoint: HashMap::new(),
+            http_assignments: HashMap::new(),
         }
     }
 
@@ -101,6 +124,9 @@ impl Default for P2PState {
             shared_files: Vec::new(),
             endpoints: HashMap::new(),
             host_endpoint_id: String::new(),
+            file_chunk_cursors: HashMap::new(),
+            file_last_http_endpoint: HashMap::new(),
+            http_assignments: HashMap::new(),
         }
     }
 }
@@ -190,6 +216,10 @@ pub async fn remove_shared_file(state: &SharedState, file_path: &str) {
     if let Some(pos) = s.shared_files.iter().position(|f| f.file_path == file_path) {
         let file_id = s.shared_files[pos].file_id.clone();
         s.shared_files.remove(pos);
+        s.file_chunk_cursors.remove(&file_id);
+        s.file_last_http_endpoint.remove(&file_id);
+        s.http_assignments
+            .retain(|_, assignment| assignment.file_id != file_id);
         // 清除各端點的相關區塊
         for ep in s.endpoints.values_mut() {
             ep.owned_chunks.remove(&file_id);

@@ -1,294 +1,513 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-Hant">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Mesh P2P Share - 下載端</title>
-  <link href="https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/css/materialdesignicons.min.css" rel="stylesheet">
-  <link href="https://cdn.jsdelivr.net/npm/vuetify@3.5.0/dist/vuetify.min.css" rel="stylesheet">
-  <style>
-    [v-cloak] { display: none; }
-    body { background-color: #EDE3CE; }
-    .log-area { 
-      max-height: 200px; 
-      overflow-y: auto; 
-      font-family: "Courier New", monospace; 
-      font-size: 0.85rem; 
-      background: rgba(123, 85, 53, 0.05);
-      border: 1.5px solid rgba(123, 85, 53, 0.15);
-    }
-    .chunk-grid { display: flex; flex-wrap: wrap; gap: 3px; }
-    .chunk-cell { width: 14px; height: 14px; border-radius: 2px; }
-    .v-application { background: #EDE3CE !important; }
-    .app-title { letter-spacing: 0.06em; }
-    .section-title { letter-spacing: 0.04em; }
-  </style>
-</head>
-<body>
-  <div id="app" v-cloak>
-    <v-app>
-      <v-app-bar flat color="primary" elevation="2">
-        <template #prepend>
-          <v-icon icon="mdi-share-circle" class="ml-3" color="white" />
-        </template>
-        <v-app-bar-title class="app-title text-white font-weight-bold">Mesh P2P Share - 下載端</v-app-bar-title>
-        <template #append>
-          <div class="d-flex align-center text-caption text-white mr-4">
-            <span class="mr-2">v{{ appVersion }} by Loren(loren.tw@gmail.com)</span>
-            <v-btn
-              icon="mdi-github"
-              variant="text"
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mesh P2P Share - 下載端</title>
+    <link
+      href="https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/css/materialdesignicons.min.css"
+      rel="stylesheet"
+    />
+    <link
+      href="https://cdn.jsdelivr.net/npm/vuetify@3.5.0/dist/vuetify.min.css"
+      rel="stylesheet"
+    />
+    <style>
+      [v-cloak] {
+        display: none;
+      }
+      body {
+        background-color: #ede3ce;
+      }
+      .log-area {
+        max-height: 200px;
+        overflow-y: auto;
+        font-family: "Courier New", monospace;
+        font-size: 0.85rem;
+        background: rgba(123, 85, 53, 0.05);
+        border: 1.5px solid rgba(123, 85, 53, 0.15);
+      }
+      .chunk-grid {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 3px;
+      }
+      .chunk-cell {
+        width: 14px;
+        height: 14px;
+        border-radius: 2px;
+      }
+      .v-application {
+        background: #ede3ce !important;
+      }
+      .app-title {
+        letter-spacing: 0.06em;
+      }
+      .section-title {
+        letter-spacing: 0.04em;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app" v-cloak>
+      <v-app>
+        <v-app-bar flat color="primary" elevation="2">
+          <template #prepend>
+            <v-icon icon="mdi-share-circle" class="ml-3" color="white" />
+          </template>
+          <v-app-bar-title class="app-title text-white font-weight-bold"
+            >Mesh P2P Share - 下載端</v-app-bar-title
+          >
+          <template #append>
+            <div class="d-flex align-center text-caption text-white mr-4">
+              <span class="mr-2"
+                >v{{ appVersion }} by Loren(loren.tw@gmail.com)</span
+              >
+              <v-btn
+                icon="mdi-github"
+                variant="text"
+                size="small"
+                color="white"
+                href="https://github.com/loren2018tw/mesh-p2p-share"
+                target="_blank"
+              />
+            </div>
+            <v-chip
+              :color="isConnected ? 'success' : 'error'"
+              variant="flat"
               size="small"
-              color="white"
-              href="https://github.com/loren2018tw/mesh-p2p-share"
-              target="_blank"
-            />
-          </div>
-          <v-chip :color="isConnected ? 'success' : 'error'" variant="flat" size="small" class="mr-3 font-weight-bold">
-            <v-icon start :icon="isConnected ? 'mdi-wifi' : 'mdi-wifi-off'" size="14"></v-icon>
-            {{ isConnected ? '已連線' : '離線' }}
-          </v-chip>
-        </template>
-      </v-app-bar>
+              class="mr-3 font-weight-bold"
+            >
+              <v-icon
+                start
+                :icon="isConnected ? 'mdi-wifi' : 'mdi-wifi-off'"
+                size="14"
+              ></v-icon>
+              {{ isConnected ? '已連線' : '離線' }}
+            </v-chip>
+          </template>
+        </v-app-bar>
 
-      <v-main>
-        <v-container class="py-8 px-4">
-          <v-row justify="center">
-            <v-col cols="12" md="10" lg="8">
-
-              <!-- 檔案清單 -->
-              <v-card class="mb-5" elevation="2" rounded="lg">
-                <v-card-item class="pt-5 pb-2">
-                  <template #prepend>
-                    <v-avatar color="primary" variant="tonal" size="44">
-                      <v-icon icon="mdi-file-multiple-outline"></v-icon>
-                    </v-avatar>
-                  </template>
-                  <v-card-title class="text-h6 font-weight-bold section-title">可下載檔案</v-card-title>
-                  <v-card-subtitle class="mt-1">{{ files.length > 0 ? `${files.length} 個檔案可供下載` : '等待分享端提供檔案...' }}</v-card-subtitle>
-                </v-card-item>
-                <v-divider class="mx-4"></v-divider>
-                <v-card-text class="pa-0">
-                  <v-list v-if="files.length" bg-color="transparent" class="py-0">
-                    <template v-for="(f, i) in files" :key="f.file_id">
-                      <v-list-item class="py-3">
-                        <template #prepend>
-                          <v-avatar color="primary" variant="tonal" size="40" class="mr-3">
-                            <v-icon icon="mdi-file-outline" size="20"></v-icon>
-                          </v-avatar>
-                        </template>
-                        
-                        <div class="d-flex align-center justify-space-between w-100">
-                          <div class="text-truncate">
-                            <span class="font-weight-medium text-truncate mr-3">{{ f.file_name }}</span>
-                            <span class="text-caption text-medium-emphasis">{{ formatBytes(f.total_size) }} · {{ f.chunk_count }} 個區塊</span>
-                          </div>
-                        </div>
-
-                        <template #append>
-                          <v-chip
-                            v-if="completedFiles.has(f.file_id)"
-                            color="success" variant="tonal" size="small"
-                            prepend-icon="mdi-check"
-                            class="font-weight-bold"
-                          >下載完成</v-chip>
-                          <div v-else-if="activeDownload && activeDownload.fileId === f.file_id" class="d-flex align-center">
-                            <v-chip color="warning" variant="tonal" size="small" class="font-weight-bold" prepend-icon="mdi-download-circle">下載中</v-chip>
-                            <v-btn icon="mdi-close-circle" variant="text" color="error" size="small" class="ml-1" @click="cancelDownload(f.file_id)"></v-btn>
-                          </div>
-                          <div v-else-if="queuedFiles.includes(f.file_id)" class="d-flex align-center">
-                            <v-chip color="grey" variant="tonal" size="small" class="font-weight-bold" prepend-icon="mdi-clock-outline">排隊中</v-chip>
-                            <v-btn icon="mdi-close-circle" variant="text" color="error" size="small" class="ml-1" @click="cancelDownload(f.file_id)"></v-btn>
-                          </div>
-                          <v-btn
-                            v-else
-                            color="primary" variant="tonal" rounded="pill" size="small"
-                            prepend-icon="mdi-download"
-                            :disabled="!isConnected"
-                            @click="startDownload(f.file_id)"
-                          >下載</v-btn>
-                        </template>
-                      </v-list-item>
-                      <v-divider v-if="i < files.length - 1" inset></v-divider>
+        <v-main>
+          <v-container class="py-8 px-4">
+            <v-row justify="center">
+              <v-col cols="12" md="10" lg="8">
+                <!-- 檔案清單 -->
+                <v-card class="mb-5" elevation="2" rounded="lg">
+                  <v-card-item class="pt-5 pb-2">
+                    <template #prepend>
+                      <v-avatar color="primary" variant="tonal" size="44">
+                        <v-icon icon="mdi-file-multiple-outline"></v-icon>
+                      </v-avatar>
                     </template>
-                  </v-list>
-                  <div v-else class="text-center pa-10 text-medium-emphasis">
-                    <v-icon icon="mdi-cloud-download-outline" size="52" color="primary" class="mb-3 opacity-20"></v-icon>
-                    <div class="text-body-1 font-weight-medium">尚無可下載的檔案</div>
-                    <div class="text-caption mt-1">等待分享端加入檔案後即可在此看到</div>
-                  </div>
-                </v-card-text>
-              </v-card>
+                    <v-card-title class="text-h6 font-weight-bold section-title"
+                      >可下載檔案</v-card-title
+                    >
+                    <v-card-subtitle class="mt-1"
+                      >{{ files.length > 0 ? `${files.length} 個檔案可供下載` :
+                      '等待分享端提供檔案...' }}</v-card-subtitle
+                    >
+                  </v-card-item>
+                  <v-divider class="mx-4"></v-divider>
+                  <v-card-text class="pa-0">
+                    <v-list
+                      v-if="files.length"
+                      bg-color="transparent"
+                      class="py-0"
+                    >
+                      <template v-for="(f, i) in files" :key="f.file_id">
+                        <v-list-item class="py-3">
+                          <template #prepend>
+                            <v-avatar
+                              color="primary"
+                              variant="tonal"
+                              size="40"
+                              class="mr-3"
+                            >
+                              <v-icon
+                                icon="mdi-file-outline"
+                                size="20"
+                              ></v-icon>
+                            </v-avatar>
+                          </template>
 
-              <!-- 下載進度 -->
-              <v-card v-if="progress" class="mb-5" elevation="2" rounded="lg">
-                <v-card-item class="pt-5 pb-2">
-                  <template #prepend>
-                    <v-avatar color="success" variant="tonal" size="44">
-                      <v-icon icon="mdi-transfer"></v-icon>
-                    </v-avatar>
-                  </template>
-                  <v-card-title class="text-h6 font-weight-bold section-title">下載進度</v-card-title>
-                  <v-card-subtitle class="mt-1">{{ progress.owned }}/{{ progress.total }} 區塊 ({{ progress.percent }}%)</v-card-subtitle>
-                </v-card-item>
-                <v-divider class="mx-4"></v-divider>
-                <v-card-text class="pt-4">
-                  <v-progress-linear :model-value="progress.percent" color="success" height="12" rounded class="mb-4"></v-progress-linear>
-                  <v-row dense>
-                    <v-col cols="4">
-                      <v-chip color="info" variant="tonal" size="small" class="w-100 justify-center font-weight-bold">
-                        <v-icon start icon="mdi-download" size="14"></v-icon> 下載: {{ downloadCount }}
-                      </v-chip>
-                    </v-col>
-                    <v-col cols="4">
-                      <v-chip color="warning" variant="tonal" size="small" class="w-100 justify-center font-weight-bold">
-                        <v-icon start icon="mdi-upload" size="14"></v-icon> 上傳: {{ uploadCount }}
-                      </v-chip>
-                    </v-col>
-                    <v-col cols="4">
-                      <v-chip color="success" variant="tonal" size="small" class="w-100 justify-center font-weight-bold">
-                        <v-icon start icon="mdi-check" size="14"></v-icon> 擁有: {{ progress.owned }}
-                      </v-chip>
-                    </v-col>
-                  </v-row>
-                  <!-- 區塊地圖 -->
-                  <div class="mt-4 chunk-grid" v-if="chunkMap.length <= 500">
-                    <div v-for="(owned, i) in chunkMap" :key="i"
-                      class="chunk-cell"
-                      :style="{ background: owned ? '#4A7050' : 'rgba(123, 85, 53, 0.1)' }"
-                      :title="`區塊 ${i}: ${owned ? '已有' : '缺少'}`"
-                    ></div>
-                  </div>
-                </v-card-text>
-              </v-card>
+                          <div
+                            class="d-flex align-center justify-space-between w-100"
+                          >
+                            <div class="text-truncate">
+                              <span
+                                class="font-weight-medium text-truncate mr-3"
+                                >{{ f.file_name }}</span
+                              >
+                              <span class="text-caption text-medium-emphasis"
+                                >{{ formatBytes(f.total_size) }} · {{
+                                f.chunk_count }} 個區塊</span
+                              >
+                              <span
+                                v-if="chunkStats.get(f.file_id)"
+                                class="text-caption ml-2"
+                              >
+                                <v-chip
+                                  size="x-small"
+                                  color="blue"
+                                  variant="tonal"
+                                  class="mr-1"
+                                >
+                                  <v-icon
+                                    start
+                                    size="10"
+                                    icon="mdi-web"
+                                  ></v-icon
+                                  >HTTP {{ chunkStats.get(f.file_id).http }}
+                                </v-chip>
+                                <v-chip
+                                  size="x-small"
+                                  color="deep-purple"
+                                  variant="tonal"
+                                  class="mr-1"
+                                >
+                                  <v-icon
+                                    start
+                                    size="10"
+                                    icon="mdi-access-point"
+                                  ></v-icon
+                                  >WebRTC {{ chunkStats.get(f.file_id).webrtc }}
+                                </v-chip>
+                                <v-chip
+                                  size="x-small"
+                                  color="orange"
+                                  variant="tonal"
+                                >
+                                  <v-icon
+                                    start
+                                    size="10"
+                                    icon="mdi-upload"
+                                  ></v-icon
+                                  >上傳 {{ chunkStats.get(f.file_id).upload }}
+                                </v-chip>
+                              </span>
+                            </div>
+                          </div>
 
-              <!-- 日誌 -->
-              <v-card elevation="2" rounded="lg">
-                <v-card-item class="pt-5 pb-2">
-                  <template #prepend>
-                    <v-avatar color="secondary" variant="tonal" size="44">
-                      <v-icon icon="mdi-console"></v-icon>
-                    </v-avatar>
-                  </template>
-                  <v-card-title class="text-h6 font-weight-bold section-title">傳輸日誌</v-card-title>
-                </v-card-item>
-                <v-divider class="mx-4"></v-divider>
-                <v-card-text>
-                  <div class="log-area pa-3 rounded" ref="logArea">
-                    <div v-for="(log, i) in logs" :key="i" :style="{ color: log.includes('失敗') || log.includes('錯誤') ? '#8B3B3B' : log.includes('完成') ? '#4A7050' : '#5C3D1E' }">
-                      {{ log }}
+                          <template #append>
+                            <v-chip
+                              v-if="completedFiles.has(f.file_id)"
+                              color="success"
+                              variant="tonal"
+                              size="small"
+                              prepend-icon="mdi-check"
+                              class="font-weight-bold"
+                              >下載完成</v-chip
+                            >
+                            <div
+                              v-else-if="activeDownload && activeDownload.fileId === f.file_id"
+                              class="d-flex align-center"
+                            >
+                              <v-chip
+                                color="warning"
+                                variant="tonal"
+                                size="small"
+                                class="font-weight-bold"
+                                prepend-icon="mdi-download-circle"
+                                >下載中</v-chip
+                              >
+                              <v-btn
+                                icon="mdi-close-circle"
+                                variant="text"
+                                color="error"
+                                size="small"
+                                class="ml-1"
+                                @click="cancelDownload(f.file_id)"
+                              ></v-btn>
+                            </div>
+                            <div
+                              v-else-if="queuedFiles.includes(f.file_id)"
+                              class="d-flex align-center"
+                            >
+                              <v-chip
+                                color="grey"
+                                variant="tonal"
+                                size="small"
+                                class="font-weight-bold"
+                                prepend-icon="mdi-clock-outline"
+                                >排隊中</v-chip
+                              >
+                              <v-btn
+                                icon="mdi-close-circle"
+                                variant="text"
+                                color="error"
+                                size="small"
+                                class="ml-1"
+                                @click="cancelDownload(f.file_id)"
+                              ></v-btn>
+                            </div>
+                            <v-btn
+                              v-else
+                              color="primary"
+                              variant="tonal"
+                              rounded="pill"
+                              size="small"
+                              prepend-icon="mdi-download"
+                              :disabled="!isConnected"
+                              @click="startDownload(f.file_id)"
+                              >下載</v-btn
+                            >
+                          </template>
+                        </v-list-item>
+                        <v-divider
+                          v-if="i < files.length - 1"
+                          inset
+                        ></v-divider>
+                      </template>
+                    </v-list>
+                    <div v-else class="text-center pa-10 text-medium-emphasis">
+                      <v-icon
+                        icon="mdi-cloud-download-outline"
+                        size="52"
+                        color="primary"
+                        class="mb-3 opacity-20"
+                      ></v-icon>
+                      <div class="text-body-1 font-weight-medium">
+                        尚無可下載的檔案
+                      </div>
+                      <div class="text-caption mt-1">
+                        等待分享端加入檔案後即可在此看到
+                      </div>
                     </div>
-                    <div v-if="!logs.length" class="text-medium-emphasis">等待事件...</div>
-                  </div>
-                </v-card-text>
-              </v-card>
+                  </v-card-text>
+                </v-card>
 
-            </v-col>
-          </v-row>
-        </v-container>
-      </v-main>
-    </v-app>
-  </div>
+                <!-- 下載進度 -->
+                <v-card v-if="progress" class="mb-5" elevation="2" rounded="lg">
+                  <v-card-item class="pt-5 pb-2">
+                    <template #prepend>
+                      <v-avatar color="success" variant="tonal" size="44">
+                        <v-icon icon="mdi-transfer"></v-icon>
+                      </v-avatar>
+                    </template>
+                    <v-card-title class="text-h6 font-weight-bold section-title"
+                      >下載進度</v-card-title
+                    >
+                    <v-card-subtitle class="mt-1"
+                      >{{ progress.owned }}/{{ progress.total }} 區塊 ({{
+                      progress.percent }}%)</v-card-subtitle
+                    >
+                  </v-card-item>
+                  <v-divider class="mx-4"></v-divider>
+                  <v-card-text class="pt-4">
+                    <v-progress-linear
+                      :model-value="progress.percent"
+                      color="success"
+                      height="12"
+                      rounded
+                      class="mb-4"
+                    ></v-progress-linear>
+                    <v-row dense>
+                      <v-col cols="4">
+                        <v-chip
+                          color="info"
+                          variant="tonal"
+                          size="small"
+                          class="w-100 justify-center font-weight-bold"
+                        >
+                          <v-icon start icon="mdi-download" size="14"></v-icon>
+                          下載: {{ downloadCount }}
+                        </v-chip>
+                      </v-col>
+                      <v-col cols="4">
+                        <v-chip
+                          color="warning"
+                          variant="tonal"
+                          size="small"
+                          class="w-100 justify-center font-weight-bold"
+                        >
+                          <v-icon start icon="mdi-upload" size="14"></v-icon>
+                          上傳: {{ uploadCount }}
+                        </v-chip>
+                      </v-col>
+                      <v-col cols="4">
+                        <v-chip
+                          color="success"
+                          variant="tonal"
+                          size="small"
+                          class="w-100 justify-center font-weight-bold"
+                        >
+                          <v-icon start icon="mdi-check" size="14"></v-icon>
+                          擁有: {{ progress.owned }}
+                        </v-chip>
+                      </v-col>
+                    </v-row>
+                    <!-- 區塊地圖 -->
+                    <div class="mt-4 chunk-grid" v-if="chunkMap.length <= 500">
+                      <div
+                        v-for="(owned, i) in chunkMap"
+                        :key="i"
+                        class="chunk-cell"
+                        :style="{ background: owned ? '#4A7050' : 'rgba(123, 85, 53, 0.1)' }"
+                        :title="`區塊 ${i}: ${owned ? '已有' : '缺少'}`"
+                      ></div>
+                    </div>
+                  </v-card-text>
+                </v-card>
 
-  <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/vuetify@3.5.0/dist/vuetify.min.js"></script>
-  <script src="p2p-client.js"></script>
-  <script>
-    const { createApp, ref, computed, onMounted, nextTick } = Vue;
-    const { createVuetify } = Vuetify;
-    
-    const vuetify = createVuetify({
-      theme: {
-        defaultTheme: 'classical',
-        themes: {
-          classical: {
-            dark: false,
-            colors: {
-              background: "#EDE3CE",
-              surface: "#F8F2E4",
-              primary: "#7B5535",
-              secondary: "#5B7850",
-              error: "#8B3B3B",
-              warning: "#9A7030",
-              info: "#486882",
-              success: "#4A7050",
+                <!-- 日誌 -->
+                <v-card elevation="2" rounded="lg">
+                  <v-card-item class="pt-5 pb-2">
+                    <template #prepend>
+                      <v-avatar color="secondary" variant="tonal" size="44">
+                        <v-icon icon="mdi-console"></v-icon>
+                      </v-avatar>
+                    </template>
+                    <v-card-title class="text-h6 font-weight-bold section-title"
+                      >傳輸日誌</v-card-title
+                    >
+                  </v-card-item>
+                  <v-divider class="mx-4"></v-divider>
+                  <v-card-text>
+                    <div class="log-area pa-3 rounded" ref="logArea">
+                      <div
+                        v-for="(log, i) in logs"
+                        :key="i"
+                        :style="{ color: log.includes('失敗') || log.includes('錯誤') ? '#8B3B3B' : log.includes('完成') ? '#4A7050' : '#5C3D1E' }"
+                      >
+                        {{ log }}
+                      </div>
+                      <div v-if="!logs.length" class="text-medium-emphasis">
+                        等待事件...
+                      </div>
+                    </div>
+                  </v-card-text>
+                </v-card>
+              </v-col>
+            </v-row>
+          </v-container>
+        </v-main>
+      </v-app>
+    </div>
+
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/vuetify@3.5.0/dist/vuetify.min.js"></script>
+    <script src="p2p-client.js"></script>
+    <script>
+      const { createApp, ref, computed, onMounted, nextTick } = Vue;
+      const { createVuetify } = Vuetify;
+
+      const vuetify = createVuetify({
+        theme: {
+          defaultTheme: "classical",
+          themes: {
+            classical: {
+              dark: false,
+              colors: {
+                background: "#EDE3CE",
+                surface: "#F8F2E4",
+                primary: "#7B5535",
+                secondary: "#5B7850",
+                error: "#8B3B3B",
+                warning: "#9A7030",
+                info: "#486882",
+                success: "#4A7050",
+              },
             },
           },
         },
-      },
-    });
+      });
 
-    const app = createApp({
-      setup() {
-        const downloader = new P2PDownloader();
-        const files = ref([]);
-        const isConnected = ref(false);
-        const activeDownload = ref(null);
-        const progress = ref(null);
-        const uploadCount = ref(0);
-        const downloadCount = ref(0);
-        const logs = ref([]);
-        const logArea = ref(null);
-        const completedFiles = ref(new Set());
-        const queuedFiles = ref([]);
-        const appVersion = ref("...");
+      const app = createApp({
+        setup() {
+          const downloader = new P2PDownloader();
+          const files = ref([]);
+          const isConnected = ref(false);
+          const activeDownload = ref(null);
+          const progress = ref(null);
+          const uploadCount = ref(0);
+          const downloadCount = ref(0);
+          const logs = ref([]);
+          const logArea = ref(null);
+          const completedFiles = ref(new Set());
+          const queuedFiles = ref([]);
+          const appVersion = ref("...");
+          const chunkStats = ref(new Map());
 
-        const chunkMap = computed(() => {
-          if (!activeDownload.value) return [];
-          const dl = downloader.activeDownload;
-          if (!dl) return [];
-          const map = [];
-          for (let i = 0; i < dl.totalChunks; i++) map.push(dl.ownedChunks.has(i));
-          return map;
-        });
-
-        downloader.onStateChange = () => {
-          files.value = [...downloader.files];
-          isConnected.value = downloader.isConnected;
-          activeDownload.value = downloader.activeDownload ? { fileId: downloader.activeDownload.fileId } : null;
-          progress.value = downloader.progress;
-          uploadCount.value = downloader.uploadCount;
-          downloadCount.value = downloader.downloadCount;
-          completedFiles.value = new Set(downloader.completedFiles);
-          queuedFiles.value = downloader.queuedFiles;
-        };
-
-        downloader.onLog = (msg) => {
-          const ts = new Date().toLocaleTimeString();
-          logs.value.push(`[${ts}] ${msg}`);
-          if (logs.value.length > 200) logs.value.splice(0, logs.value.length - 200);
-          nextTick(() => {
-            if (logArea.value) logArea.value.scrollTop = logArea.value.scrollHeight;
+          const chunkMap = computed(() => {
+            if (!activeDownload.value) return [];
+            const dl = downloader.activeDownload;
+            if (!dl) return [];
+            const map = [];
+            for (let i = 0; i < dl.totalChunks; i++)
+              map.push(dl.ownedChunks.has(i));
+            return map;
           });
-        };
 
-        function formatBytes(bytes) {
-          if (bytes === 0) return '0 B';
-          const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-          const i = Math.floor(Math.log(bytes) / Math.log(1024));
-          return `${(bytes / 1024 ** i).toFixed(1)} ${sizes[i]}`;
-        }
+          downloader.onStateChange = () => {
+            files.value = [...downloader.files];
+            isConnected.value = downloader.isConnected;
+            activeDownload.value = downloader.activeDownload
+              ? { fileId: downloader.activeDownload.fileId }
+              : null;
+            progress.value = downloader.progress;
+            uploadCount.value = downloader.uploadCount;
+            downloadCount.value = downloader.downloadCount;
+            completedFiles.value = new Set(downloader.completedFiles);
+            queuedFiles.value = downloader.queuedFiles;
+            chunkStats.value = new Map(downloader.chunkStats);
+          };
 
-        function startDownload(fileId) {
-          downloader.startDownload(fileId);
-        }
+          downloader.onLog = (msg) => {
+            const ts = new Date().toLocaleTimeString();
+            logs.value.push(`[${ts}] ${msg}`);
+            if (logs.value.length > 200)
+              logs.value.splice(0, logs.value.length - 200);
+            nextTick(() => {
+              if (logArea.value)
+                logArea.value.scrollTop = logArea.value.scrollHeight;
+            });
+          };
 
-        function cancelDownload(fileId) {
-          downloader.cancelDownload(fileId);
-        }
+          function formatBytes(bytes) {
+            if (bytes === 0) return "0 B";
+            const sizes = ["B", "KB", "MB", "GB", "TB"];
+            const i = Math.floor(Math.log(bytes) / Math.log(1024));
+            return `${(bytes / 1024 ** i).toFixed(1)} ${sizes[i]}`;
+          }
 
-        onMounted(async () => {
-          downloader.connect();
-          try {
-            const resp = await fetch('/api/version');
-            if (resp.ok) appVersion.value = await resp.text();
-          } catch (e) {}
-        });
+          function startDownload(fileId) {
+            downloader.startDownload(fileId);
+          }
 
-        return { files, isConnected, activeDownload, progress, uploadCount, downloadCount, logs, logArea, chunkMap, formatBytes, startDownload, cancelDownload, completedFiles, queuedFiles, appVersion };
-      }
-    });
-    app.use(vuetify).mount('#app');
-  </script>
-</body>
+          function cancelDownload(fileId) {
+            downloader.cancelDownload(fileId);
+          }
+
+          onMounted(async () => {
+            downloader.connect();
+            try {
+              const resp = await fetch("/api/version");
+              if (resp.ok) appVersion.value = await resp.text();
+            } catch (e) {}
+          });
+
+          return {
+            files,
+            isConnected,
+            activeDownload,
+            progress,
+            uploadCount,
+            downloadCount,
+            logs,
+            logArea,
+            chunkMap,
+            formatBytes,
+            startDownload,
+            cancelDownload,
+            completedFiles,
+            queuedFiles,
+            appVersion,
+            chunkStats,
+          };
+        },
+      });
+      app.use(vuetify).mount("#app");
+    </script>
+  </body>
 </html>

@@ -26,6 +26,7 @@ class P2PDownloader {
     this.peerConnections = new Map(); // peerId -> RTCPeerConnection
     this.uploadCount = 0;
     this.downloadCount = 0;
+    this.webrtcDownloadCount = 0;
     this.chunkBuffers = new Map(); // fileId -> Map<chunkIndex, Uint8Array>
     this.pendingRequests = new Set(); // chunk indices currently being requested/downloaded
     this.onStateChange = null;
@@ -34,6 +35,8 @@ class P2PDownloader {
     this.maxConcurrentDownloads = 3;
     this.completedFiles = new Set(); // 已完成下載的 fileId
     this.downloadQueue = []; // { fileId, fileHandle, totalChunks, ... }
+    // 每個 fileId 的 HTTP / WebRTC 下載成功區塊數
+    this.chunkStats = new Map(); // fileId -> { http: number, webrtc: number, upload: number }
   }
 
   log(msg) {
@@ -82,7 +85,7 @@ class P2PDownloader {
           file_id: '', // 空 ID 表示基本狀態
           owned_chunks: [],
           upload_count: this.uploadCount,
-          download_count: this.downloadCount
+          download_count: this.webrtcDownloadCount
         }));
         return;
       }
@@ -105,7 +108,7 @@ class P2PDownloader {
           file_id: fileId,
           owned_chunks: owned,
           upload_count: this.uploadCount,
-          download_count: this.downloadCount
+          download_count: this.webrtcDownloadCount
         }));
       }
     }, 2000);
@@ -303,30 +306,31 @@ class P2PDownloader {
     // 但保留以向後兼容
   }
 
-  // ── HTTP 區塊下載（從 Host 種子） ──
+  // ── HTTP 區塊下載（從 Host 種子，屬於 HTTP pool，不計入 WebRTC 下載連線數） ──
   async _downloadChunkViaHttp(fileId, chunkIndex) {
     this.downloadCount++;
     this._notifyStateChange();
-    this._send({ type: 'transfer_started', endpoint_id: this.endpointId, file_id: fileId, chunk_index: chunkIndex, is_upload: false });
+    // 注意：HTTP pool 不發送 transfer_started/finished，不佔用 WebRTC download_count
     try {
-      const resp = await fetch(`/api/chunks/${fileId}/${chunkIndex}`);
+      const endpointId = encodeURIComponent(this.endpointId);
+      const resp = await fetch(`/api/chunks/${fileId}/${chunkIndex}?endpoint_id=${endpointId}`);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = new Uint8Array(await resp.arrayBuffer());
       await this._onChunkReceived(fileId, chunkIndex, data, 'host-http');
     } catch (e) {
       this.log(`HTTP 下載區塊 ${chunkIndex} 失敗: ${e.message}`);
       this.pendingRequests.delete(chunkIndex);
-      // 在新模式下，中控會自動重新分配失敗的分片
+      // 中控在下次觸發時會自動重新分配此片段
     } finally {
       this.downloadCount--;
       this._notifyStateChange();
-      this._send({ type: 'transfer_finished', endpoint_id: this.endpointId, file_id: fileId, chunk_index: chunkIndex, is_upload: false });
     }
   }
 
   // ── WebRTC 區塊下載 ──
   async _downloadChunkViaWebRTC(fileId, chunkIndex, peerId) {
     this.downloadCount++;
+    this.webrtcDownloadCount++;
     this._notifyStateChange();
     this._send({ type: 'transfer_started', endpoint_id: this.endpointId, file_id: fileId, chunk_index: chunkIndex, is_upload: false });
     try {
@@ -381,6 +385,7 @@ class P2PDownloader {
           this.peerConnections.delete(key);
           this.pendingRequests.delete(chunkIndex);
           this.downloadCount--;
+          this.webrtcDownloadCount--;
           this._notifyStateChange();
           this.log(`WebRTC 下載區塊 ${chunkIndex} 逾時（30 秒）: 來源端 ${peerId.slice(0, 8)} 未回應`);
           this._send({
@@ -405,6 +410,7 @@ class P2PDownloader {
         reason: `exception:${e.message}`
       });
       this.downloadCount--;
+      this.webrtcDownloadCount--;
       this.pendingRequests.delete(chunkIndex);
       this._notifyStateChange();
       // 中控會自動重新分配失敗的分片
@@ -477,6 +483,9 @@ class P2PDownloader {
         this._notifyStateChange();
         this._send({ type: 'transfer_finished', endpoint_id: this.endpointId, file_id, chunk_index, is_upload: true });
         this.log(`上傳區塊 ${chunk_index} 完成 ✓ → 端點 ${from.slice(0, 8)}...`);
+        // 累加此檔案的上傳區塊數
+        if (!this.chunkStats.has(file_id)) this.chunkStats.set(file_id, { http: 0, webrtc: 0, upload: 0 });
+        this.chunkStats.get(file_id).upload++;
         pc.close();
       };
     };
@@ -558,12 +567,22 @@ class P2PDownloader {
     dl.ownedChunks.add(chunkIndex);
     this.pendingRequests.delete(chunkIndex);
 
+    // 更新 HTTP / WebRTC 統計
+    if (!this.chunkStats.has(fileId)) this.chunkStats.set(fileId, { http: 0, webrtc: 0, upload: 0 });
+    const stats = this.chunkStats.get(fileId);
+    if (sourcePeer === 'host-http') {
+      stats.http++;
+    } else {
+      stats.webrtc++;
+    }
+
     // 清理 peer connection
     if (sourcePeer && sourcePeer !== 'host-http') {
       const key = `${sourcePeer}-${chunkIndex}`;
       const conn = this.peerConnections.get(key);
       if (conn) { conn.pc.close(); this.peerConnections.delete(key); }
       this.downloadCount--;
+      this.webrtcDownloadCount--;
     }
 
     this._send({
