@@ -1,0 +1,61 @@
+name: Release
+on:
+  workflow_dispatch:
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Rust setup
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 9
+
+      - name: Node.js setup
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: get date
+        id: date
+        shell: bash
+        run: |
+          STAMP=$(date +'%m%d%H%M')
+          echo "STAMP=${STAMP}" >> $GITHUB_OUTPUT
+          echo "TAG=dev-${STAMP}" >> $GITHUB_OUTPUT
+          echo "VERSION=0.0.0-dev-${STAMP}" >> $GITHUB_OUTPUT
+
+      - name: set version
+        shell: bash
+        run: |
+          VERSION=${{ steps.date.outputs.VERSION }}
+          sed -i "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" src-tauri/tauri.conf.json
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ steps.date.outputs.TAG }}
+          releaseName: ${{ steps.date.outputs.TAG }}
+          releaseDraft: false
+          prerelease: false
+          args: --bundles nsis
