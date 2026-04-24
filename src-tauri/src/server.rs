@@ -797,7 +797,7 @@ async fn host_http_dispatch(state: &ServerState) {
             let old_cur = cur;
             let last_endpoint = s.file_last_http_endpoint.get(file_id).cloned();
 
-            // 依序掃描端點，有缺游標片段就分配（游標前進），沒有就跳過（游標不動）
+            // 依序掃描端點，從游標往後找第一個缺片再分配
             // 若候選超過 1 個，先跑非「上次指派端點」再回補，避免連續指派到同端點。
             for pass in 0..2 {
                 for (ep_id, owned) in &active_downloaders {
@@ -813,13 +813,22 @@ async fn host_http_dispatch(state: &ServerState) {
                         continue;
                     }
 
-                    if owned.contains(&cur) {
-                        // 此端點已有游標位置的片段，跳過
-                        continue;
+                    let mut selected_chunk: Option<u32> = None;
+                    for offset in 0..chunk_count {
+                        let candidate = (cur + offset) % chunk_count;
+                        if !owned.contains(&candidate) {
+                            selected_chunk = Some(candidate);
+                            break;
+                        }
                     }
 
-                    // 此端點缺少游標片段，分配並前進游標
-                    to_assign.push((ep_id.clone(), file_id.clone(), cur));
+                    let Some(chunk_idx) = selected_chunk else {
+                        // 此端點已無缺片，不需要再派 HTTP。
+                        continue;
+                    };
+
+                    // 此端點找到缺片，分配並以前進到下一片為新游標。
+                    to_assign.push((ep_id.clone(), file_id.clone(), chunk_idx));
                     assigned_this_round.insert(ep_id.clone());
                     s.file_last_http_endpoint
                         .insert(file_id.clone(), ep_id.clone());
@@ -827,12 +836,12 @@ async fn host_http_dispatch(state: &ServerState) {
                         ep_id.clone(),
                         p2p::HttpChunkAssignment {
                             file_id: file_id.clone(),
-                            chunk_index: cur,
+                            chunk_index: chunk_idx,
                             started: false,
                             assigned_at: now,
                         },
                     );
-                    cur = (cur + 1) % chunk_count;
+                    cur = (chunk_idx + 1) % chunk_count;
                 }
             }
 
