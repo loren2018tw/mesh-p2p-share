@@ -1150,12 +1150,13 @@ pub async fn run_server(
 
     println!("[server] 已啟動，入口網址: {}", url);
 
-    // 啟動背景配對掃描 Timer（每 1.5 秒執行一次）
+    // 啟動背景分派掃描 Timer（每 1.5 秒執行一次）
     let state_clone = server_state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(1500));
         loop {
             interval.tick().await;
+            host_http_dispatch(&state_clone).await;
             find_and_assign_matches(&state_clone).await;
         }
     });

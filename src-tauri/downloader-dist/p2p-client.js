@@ -16,6 +16,10 @@ const CRC32 = (() => {
   };
 })();
 
+// 只在「無進度」時中斷，持續收到資料就會延長。
+const WEBRTC_CHUNK_IDLE_TIMEOUT_MS = 30000;
+const WEBRTC_TIMEOUT_CHECK_INTERVAL_MS = 1000;
+
 // ── P2P 下載管理器 ──
 class P2PDownloader {
   constructor() {
@@ -333,6 +337,11 @@ class P2PDownloader {
     this.webrtcDownloadCount++;
     this._notifyStateChange();
     this._send({ type: 'transfer_started', endpoint_id: this.endpointId, file_id: fileId, chunk_index: chunkIndex, is_upload: false });
+
+    const key = `${peerId}-${chunkIndex}`;
+    let lastProgressAt = Date.now();
+    let idleTimeoutChecker = null;
+
     try {
       const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
       const dc = pc.createDataChannel(`chunk-${fileId}-${chunkIndex}`, { ordered: true });
@@ -341,10 +350,14 @@ class P2PDownloader {
       let totalReceived = 0;
 
       dc.binaryType = 'arraybuffer';
+      dc.onopen = () => {
+        lastProgressAt = Date.now();
+      };
       dc.onmessage = (e) => {
         if (typeof e.data === 'string') {
           const ctrl = JSON.parse(e.data);
           if (ctrl.type === 'chunk_complete') {
+            lastProgressAt = Date.now();
             const fullData = this._concatArrayBuffers(received, totalReceived);
             this._onChunkReceived(fileId, chunkIndex, fullData, peerId);
             this._send({ type: 'transfer_finished', endpoint_id: this.endpointId, file_id: fileId, chunk_index: chunkIndex, is_upload: false });
@@ -353,6 +366,7 @@ class P2PDownloader {
         }
         received.push(new Uint8Array(e.data));
         totalReceived += e.data.byteLength;
+        lastProgressAt = Date.now();
       };
 
       dc.onclose = () => pc.close();
@@ -375,31 +389,51 @@ class P2PDownloader {
       });
 
       // 存 pc 以便處理 answer
-      this.peerConnections.set(`${peerId}-${chunkIndex}`, { pc, dc, fileId, chunkIndex });
+      this.peerConnections.set(key, { pc, dc, fileId, chunkIndex });
 
-      // 超時處理
-      setTimeout(() => {
-        const key = `${peerId}-${chunkIndex}`;
-        if (this.peerConnections.has(key)) {
-          this.peerConnections.get(key).pc.close();
-          this.peerConnections.delete(key);
-          this.pendingRequests.delete(chunkIndex);
-          this.downloadCount--;
-          this.webrtcDownloadCount--;
-          this._notifyStateChange();
-          this.log(`WebRTC 下載區塊 ${chunkIndex} 逾時（30 秒）: 來源端 ${peerId.slice(0, 8)} 未回應`);
-          this._send({
-            type: 'transfer_failed',
-            endpoint_id: this.endpointId,
-            file_id: fileId,
-            chunk_index: chunkIndex,
-            source_peer: peerId,
-            reason: 'timeout'
-          });
-          this._send({ type: 'transfer_finished', endpoint_id: this.endpointId, file_id: fileId, chunk_index: chunkIndex, is_upload: false });
+      // 無進度逾時處理：只要持續收到資料就延長，不會被固定總時限中斷。
+      idleTimeoutChecker = setInterval(() => {
+        if (!this.peerConnections.has(key)) {
+          clearInterval(idleTimeoutChecker);
+          idleTimeoutChecker = null;
+          return;
         }
-      }, 30000);
+
+        if (Date.now() - lastProgressAt < WEBRTC_CHUNK_IDLE_TIMEOUT_MS) {
+          return;
+        }
+
+        clearInterval(idleTimeoutChecker);
+        idleTimeoutChecker = null;
+
+        const conn = this.peerConnections.get(key);
+        if (conn) conn.pc.close();
+        this.peerConnections.delete(key);
+        this.pendingRequests.delete(chunkIndex);
+        this.downloadCount = Math.max(0, this.downloadCount - 1);
+        this.webrtcDownloadCount = Math.max(0, this.webrtcDownloadCount - 1);
+        this._notifyStateChange();
+        this.log(`WebRTC 下載區塊 ${chunkIndex} 無進度逾時（${WEBRTC_CHUNK_IDLE_TIMEOUT_MS / 1000} 秒）: 來源端 ${peerId.slice(0, 8)} 未回應`);
+        this._send({
+          type: 'transfer_failed',
+          endpoint_id: this.endpointId,
+          file_id: fileId,
+          chunk_index: chunkIndex,
+          source_peer: peerId,
+          reason: 'idle_timeout'
+        });
+        this._send({ type: 'transfer_finished', endpoint_id: this.endpointId, file_id: fileId, chunk_index: chunkIndex, is_upload: false });
+      }, WEBRTC_TIMEOUT_CHECK_INTERVAL_MS);
     } catch (e) {
+      if (idleTimeoutChecker) {
+        clearInterval(idleTimeoutChecker);
+        idleTimeoutChecker = null;
+      }
+
+      const conn = this.peerConnections.get(key);
+      if (conn) conn.pc.close();
+      this.peerConnections.delete(key);
+
       this.log(`WebRTC 下載區塊 ${chunkIndex} 失敗: ${e.message}`);
       this._send({
         type: 'transfer_failed',
@@ -409,10 +443,11 @@ class P2PDownloader {
         source_peer: peerId,
         reason: `exception:${e.message}`
       });
-      this.downloadCount--;
-      this.webrtcDownloadCount--;
+      this.downloadCount = Math.max(0, this.downloadCount - 1);
+      this.webrtcDownloadCount = Math.max(0, this.webrtcDownloadCount - 1);
       this.pendingRequests.delete(chunkIndex);
       this._notifyStateChange();
+      this._send({ type: 'transfer_finished', endpoint_id: this.endpointId, file_id: fileId, chunk_index: chunkIndex, is_upload: false });
       // 中控會自動重新分配失敗的分片
     }
   }
