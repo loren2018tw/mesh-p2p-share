@@ -298,14 +298,13 @@ async fn get_chunk_data(
     // 增加 host 的上傳計數
     let result = p2p::read_chunk_data(&state.p2p_state, &file_id, chunk_index).await;
 
-    // 減少 host 的上傳計數，並釋放此端點的 HTTP 指派鎖
+    // 減少 host 的上傳計數
     {
         let mut s = state.p2p_state.write().await;
         let host_id = s.host_endpoint_id.clone();
         if let Some(ep) = s.endpoints.get_mut(&host_id) {
             ep.upload_count = ep.upload_count.saturating_sub(1);
         }
-        s.http_assignments.remove(&endpoint_id);
     }
 
     match result {
@@ -504,9 +503,16 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
                 let mut s = state.p2p_state.write().await;
                 if let Some(ep) = s.endpoints.get_mut(&eid) {
                     ep.owned_chunks
-                        .entry(file_id)
+                        .entry(file_id.clone())
                         .or_insert_with(HashSet::new)
                         .insert(chunk_index);
+                }
+
+                // Host HTTP 指派僅在下載端回報完成該片段後才釋放，避免寫入尚未完成就重複分派。
+                if let Some(assignment) = s.http_assignments.get(&eid) {
+                    if assignment.file_id == file_id && assignment.chunk_index == chunk_index {
+                        s.http_assignments.remove(&eid);
+                    }
                 }
                 drop(s);
 
@@ -596,6 +602,14 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
                         source_peer.clone(),
                         Instant::now() + Duration::from_secs(20),
                     );
+                } else if source_peer == host_id {
+                    // Host HTTP 來源失敗時，釋放該端點的 HTTP 指派，讓中控可重新分派。
+                    let mut s = state.p2p_state.write().await;
+                    if let Some(assignment) = s.http_assignments.get(&endpoint_id) {
+                        if assignment.file_id == file_id && assignment.chunk_index == chunk_index {
+                            s.http_assignments.remove(&endpoint_id);
+                        }
+                    }
                 }
 
                 println!(
@@ -913,16 +927,6 @@ async fn host_http_dispatch(state: &ServerState) {
             s.http_assignments.remove(&endpoint_id);
         }
     }
-
-    let in_flight_after = {
-        let s = state.p2p_state.read().await;
-        s.http_assignments.len()
-    };
-    println!(
-        "[HTTP分派統計] 本輪指派={} 在途={}",
-        to_assign.len(),
-        in_flight_after
-    );
 }
 
 /// WebRTC 端點間配對：讓瀏覽器端點互相用 WebRTC 分享片段
