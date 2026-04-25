@@ -450,7 +450,12 @@
             downloadCount.value = downloader.downloadCount;
             completedFiles.value = new Set(downloader.completedFiles);
             queuedFiles.value = downloader.queuedFiles;
-            chunkStats.value = new Map(downloader.chunkStats);
+            // 保留既有統計，避免完成檔案的顯示在後續刷新時消失。
+            const mergedStats = new Map(chunkStats.value);
+            for (const [fileId, stats] of downloader.chunkStats.entries()) {
+              mergedStats.set(fileId, { ...stats });
+            }
+            chunkStats.value = mergedStats;
           };
 
           downloader.onLog = (msg) => {

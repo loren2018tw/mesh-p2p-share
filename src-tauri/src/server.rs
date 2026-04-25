@@ -183,6 +183,10 @@ pub enum ServerMessage {
         chunk_index: u32,
         reporter: String,
     },
+
+    /// 通知其他端點某個 peer 已斷線（讓下載端可立即中止 WebRTC 傳輸）
+    #[serde(rename = "peer_disconnected")]
+    PeerDisconnected { endpoint_id: String },
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -627,13 +631,31 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
         }
     }
 
-    // 清理斷線的端點
-    if let Some(eid) = endpoint_id.lock().await.as_ref() {
+    // 清理斷線的端點，並廣播斷線通知給其他端點
+    let disconnected_id = endpoint_id.lock().await.clone();
+    if let Some(eid) = &disconnected_id {
+        // 先移除 sender，再廣播給剩餘端點
         state.ws_senders.write().await.remove(eid);
-        let mut s = state.p2p_state.write().await;
-        s.endpoints.remove(eid);
-        s.http_assignments.remove(eid);
+        {
+            let mut s = state.p2p_state.write().await;
+            s.endpoints.remove(eid);
+            s.http_assignments.remove(eid);
+        }
         println!("[ws] 端點 {} 已斷線", eid);
+
+        // 廣播 peer_disconnected 給所有仍在線的端點，讓他們立即中止 WebRTC 傳輸
+        let senders = state.ws_senders.read().await;
+        let msg = ServerMessage::PeerDisconnected {
+            endpoint_id: eid.clone(),
+        };
+        for (_, tx) in senders.iter() {
+            let _ = tx.send(msg.clone());
+        }
+        drop(senders);
+
+        // 重新觸發分派，讓剩餘端點繼續下載不被卡住
+        host_http_dispatch(&state).await;
+        find_and_assign_matches(&state).await;
     }
 
     send_task.abort();

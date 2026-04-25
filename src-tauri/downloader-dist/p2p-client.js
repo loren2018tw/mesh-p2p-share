@@ -57,8 +57,22 @@ class P2PDownloader {
     this.chunkStats = new Map(); // fileId -> { http: number, webrtc: number, upload: number }
   }
 
+  _formatLogTimestamp() {
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, '0');
+    const mm = String(now.getMinutes()).padStart(2, '0');
+    const ss = String(now.getSeconds()).padStart(2, '0');
+    const mmm = String(now.getMilliseconds()).padStart(3, '0');
+    return `${hh}:${mm}:${ss}.${mmm}`;
+  }
+
   log(msg) {
-    console.log(`[P2P] ${msg}`);
+    const local = this.endpointId ? this.endpointId.slice(0, 8) : 'unknown';
+    const formatted = `[${this._formatLogTimestamp()}][${local}] ${msg}`;
+    console.log(`[P2P] ${formatted}`);
+  }
+
+  uiLog(msg) {
     if (this.onLog) this.onLog(msg);
   }
 
@@ -167,7 +181,37 @@ class P2PDownloader {
       case 'chunk_verify_failed_notify':
         this._handleVerifyFailedNotify(msg);
         break;
+      case 'peer_disconnected':
+        this._handlePeerDisconnected(msg.endpoint_id);
+        break;
     }
+  }
+
+  // 來源端點斷線：立即中止所有對該 peer 的 WebRTC 下載，觸發 transfer_failed 讓中控重新分派
+  _handlePeerDisconnected(peerId) {
+    this.log(`收到 peer_disconnected: ${peerId.slice(0, 8)}...`);
+    for (const [key, conn] of this.peerConnections) {
+      // key 格式: `${peerId}-${chunkIndex}`
+      if (!key.startsWith(peerId + '-')) continue;
+      const { fileId, chunkIndex } = conn;
+      conn.pc.close();
+      this.peerConnections.delete(key);
+      this.pendingRequests.delete(chunkIndex);
+      this.downloadCount = Math.max(0, this.downloadCount - 1);
+      this.webrtcDownloadCount = Math.max(0, this.webrtcDownloadCount - 1);
+      this.log(`WebRTC 下載中止（來源端斷線）: 區塊 ${chunkIndex} ← ${peerId.slice(0, 8)}...`);
+      this.uiLog(`來源端點 ${peerId.slice(0, 8)}... 已斷線，區塊 ${chunkIndex} 等待重新分派`);
+      this._send({
+        type: 'transfer_failed',
+        endpoint_id: this.endpointId,
+        file_id: fileId,
+        chunk_index: chunkIndex,
+        source_peer: peerId,
+        reason: 'peer_disconnected'
+      });
+      this._send({ type: 'transfer_finished', endpoint_id: this.endpointId, file_id: fileId, chunk_index: chunkIndex, is_upload: false });
+    }
+    this._notifyStateChange();
   }
 
   _handleFileChunksInfo(msg) {
@@ -200,6 +244,7 @@ class P2PDownloader {
 
       this.downloadQueue.push(downloadTask);
       this.log(`已加入下載排程: ${file.file_name}`);
+      this.uiLog(`已加入下載佇列: ${file.file_name}`);
       this._notifyStateChange();
       this._checkQueue();
     } catch (e) {
@@ -264,6 +309,7 @@ class P2PDownloader {
 
       const fileName = this.files.find(f => f.file_id === task.fileId)?.file_name;
       this.log(`開始下載: ${fileName}`);
+      this.uiLog(`開始下載: ${fileName}`);
       this._notifyStateChange();
 
       // 向中控中心回報下載意圖，會觸發 file_chunks_info 回傳
@@ -298,6 +344,7 @@ class P2PDownloader {
     if (this.pendingRequests.has(chunk_index)) return; // 已在下載中，忽略重複指派
 
     this.log(`中控指令: 區塊 ${chunk_index} 來自 ${source_peer.slice(0, 8)}...`);
+    this.uiLog(`下載區塊 ${chunk_index}：來源端點 ${source_peer.slice(0, 8)}...`);
     this.pendingRequests.add(chunk_index);
 
     // 如果來源是 host（分享端），透過 HTTP 下載
@@ -382,6 +429,7 @@ class P2PDownloader {
       await this._onChunkReceived(fileId, chunkIndex, data, 'host-http');
     } catch (e) {
       this.log(`HTTP 下載區塊 ${chunkIndex} 失敗: ${e.message}`);
+      this.uiLog(`區塊 ${chunkIndex} 下載失敗（HTTP），等待重試`);
       this.pendingRequests.delete(chunkIndex);
       this._send({
         type: 'transfer_failed',
@@ -406,8 +454,10 @@ class P2PDownloader {
     this.webrtcDownloadCount++;
     this._notifyStateChange();
     this._send({ type: 'transfer_started', endpoint_id: this.endpointId, file_id: fileId, chunk_index: chunkIndex, is_upload: false });
+    this.log(`WebRTC 下載開始: file=${fileId}, chunk=${chunkIndex}, peer=${peerId.slice(0, 8)}...`);
 
     const key = `${peerId}-${chunkIndex}`;
+    const startAt = Date.now();
     let lastProgressAt = Date.now();
     let idleTimeoutChecker = null;
     let writeChain = Promise.resolve();
@@ -416,6 +466,13 @@ class P2PDownloader {
     try {
       const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
       const dc = pc.createDataChannel(`chunk-${fileId}-${chunkIndex}`, { ordered: true });
+
+      pc.onconnectionstatechange = () => {
+        this.log(`WebRTC 下載連線狀態: 區塊 ${chunkIndex}，peer=${peerId.slice(0, 8)}...，state=${pc.connectionState}`);
+      };
+      pc.oniceconnectionstatechange = () => {
+        this.log(`WebRTC 下載 ICE 狀態: 區塊 ${chunkIndex}，peer=${peerId.slice(0, 8)}...，state=${pc.iceConnectionState}`);
+      };
 
       const chunkMeta = this.activeDownload?.fileInfo?.chunks?.[chunkIndex];
       const expectedSize = chunkMeta?.size;
@@ -427,6 +484,7 @@ class P2PDownloader {
       dc.binaryType = 'arraybuffer';
       dc.onopen = () => {
         lastProgressAt = Date.now();
+        this.log(`WebRTC 下載資料通道已開啟: 區塊 ${chunkIndex} ← 來源端 ${peerId.slice(0, 8)}...`);
       };
       dc.onmessage = (e) => {
         if (typeof e.data === 'string') {
@@ -435,6 +493,7 @@ class P2PDownloader {
             if (streamEnded) return;
             streamEnded = true;
             lastProgressAt = Date.now();
+            this.log(`WebRTC 下載收到 chunk_complete: 區塊 ${chunkIndex}，目前累計 ${receivedBytes} bytes`);
             (async () => {
               await writeChain;
 
@@ -490,8 +549,13 @@ class P2PDownloader {
           clearInterval(idleTimeoutChecker);
           idleTimeoutChecker = null;
         }
+        this.log(`WebRTC 下載資料通道關閉: 區塊 ${chunkIndex}，累計 ${receivedBytes} bytes`);
         this.peerConnections.delete(key);
         pc.close();
+      };
+      dc.onerror = (ev) => {
+        const errMsg = ev?.error?.message || ev?.message || 'unknown';
+        this.log(`WebRTC 下載資料通道錯誤: 區塊 ${chunkIndex}，peer=${peerId.slice(0, 8)}...，error=${errMsg}`);
       };
 
       // ICE candidate 傳送
@@ -510,6 +574,7 @@ class P2PDownloader {
         type: 'webrtc_signal', from: this.endpointId, to: peerId,
         signal: { type: 'offer', sdp: offer.sdp, file_id: fileId, chunk_index: chunkIndex }
       });
+      this.log(`WebRTC 下載已送出 offer: 區塊 ${chunkIndex} -> ${peerId.slice(0, 8)}...`);
 
       // 存 pc 以便處理 answer
       this.peerConnections.set(key, { pc, dc, fileId, chunkIndex });
@@ -528,6 +593,7 @@ class P2PDownloader {
 
         clearInterval(idleTimeoutChecker);
         idleTimeoutChecker = null;
+        const idleForMs = Date.now() - lastProgressAt;
 
         const conn = this.peerConnections.get(key);
         if (conn) conn.pc.close();
@@ -536,7 +602,8 @@ class P2PDownloader {
         this.downloadCount = Math.max(0, this.downloadCount - 1);
         this.webrtcDownloadCount = Math.max(0, this.webrtcDownloadCount - 1);
         this._notifyStateChange();
-        this.log(`WebRTC 下載區塊 ${chunkIndex} 無進度逾時（${WEBRTC_CHUNK_IDLE_TIMEOUT_MS / 1000} 秒）: 來源端 ${peerId.slice(0, 8)} 未回應`);
+        this.log(`WebRTC 下載區塊 ${chunkIndex} 無進度逾時（${WEBRTC_CHUNK_IDLE_TIMEOUT_MS / 1000} 秒）: 來源端 ${peerId.slice(0, 8)} 未回應（idle=${idleForMs}ms, recv=${receivedBytes} bytes, totalElapsed=${Date.now() - startAt}ms）`);
+        this.uiLog(`區塊 ${chunkIndex} 下載逾時（來源端點 ${peerId.slice(0, 8)}...），等待重試`);
         this._send({
           type: 'transfer_failed',
           endpoint_id: this.endpointId,
@@ -581,18 +648,25 @@ class P2PDownloader {
 
     if (signal.type === 'offer') {
       // 收到 offer：有人要跟我們要區塊
+      this.log(`WebRTC 收到 offer: 區塊 ${signal.chunk_index} <- ${from.slice(0, 8)}...`);
       await this._handleIncomingOffer(from, signal);
     } else if (signal.type === 'answer') {
       const key = `${from}-${signal.chunk_index}`;
       const conn = this.peerConnections.get(key);
       if (conn) {
+        this.log(`WebRTC 收到 answer: 區塊 ${signal.chunk_index} <- ${from.slice(0, 8)}...`);
         await conn.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: signal.sdp }));
+      } else {
+        this.log(`WebRTC 收到 answer 但找不到連線: key=${key}, file=${signal.file_id || 'unknown'}`);
       }
     } else if (signal.type === 'ice') {
       const key = `${from}-${signal.chunk_index}`;
       const conn = this.peerConnections.get(key);
       if (conn) {
         await conn.pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+        this.log(`WebRTC 收到 ICE: 區塊 ${signal.chunk_index} <- ${from.slice(0, 8)}...`);
+      } else {
+        this.log(`WebRTC 收到 ICE 但找不到連線: key=${key}, file=${signal.file_id || 'unknown'}`);
       }
     }
   }
@@ -601,6 +675,7 @@ class P2PDownloader {
     const { file_id, chunk_index, sdp } = signal;
     const hasChunk = this._hasChunkForUpload(file_id, chunk_index);
     if (!hasChunk) return;
+    const key = `${from}-${chunk_index}`;
 
     this.uploadCount++;
     this._notifyStateChange();
@@ -608,6 +683,9 @@ class P2PDownloader {
     this.log(`上傳區塊 ${chunk_index} 給端點 ${from.slice(0, 8)}...`);
 
     const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    // 必須先註冊連線，否則對端 ICE 可能先到，會被誤判為找不到連線。
+    this.peerConnections.set(key, { pc, dc: null, fileId: file_id, chunkIndex: chunk_index });
+    this.log(`WebRTC 上傳連線已註冊: key=${key}`);
 
     pc.onicecandidate = (e) => {
       if (e.candidate) {
@@ -620,6 +698,9 @@ class P2PDownloader {
 
     pc.ondatachannel = (e) => {
       const dc = e.channel;
+      this.log(`WebRTC 上傳收到資料通道: 區塊 ${chunk_index} <- 端點 ${from.slice(0, 8)}...，label=${dc.label}`);
+      const conn = this.peerConnections.get(key);
+      if (conn) conn.dc = dc;
       let uploadSettled = false;
 
       const settleUpload = (options = {}) => {
@@ -638,6 +719,7 @@ class P2PDownloader {
           this.log(`上傳區塊 ${chunk_index} 未完成: ${options.reason} → 端點 ${from.slice(0, 8)}...`);
         }
 
+        this.peerConnections.delete(key);
         pc.close();
       };
 
@@ -661,8 +743,10 @@ class P2PDownloader {
       dc.onclose = () => {
         settleUpload({ reason: '資料通道關閉前未收到接收確認' });
       };
-      dc.onerror = () => {
-        settleUpload({ reason: '資料通道錯誤' });
+      dc.onerror = (ev) => {
+        const errMsg = ev?.error?.message || ev?.message || 'unknown';
+        this.log(`WebRTC 上傳資料通道錯誤: 區塊 ${chunk_index} -> 端點 ${from.slice(0, 8)}...，error=${errMsg}`);
+        settleUpload({ reason: `資料通道錯誤: ${errMsg}` });
       };
     };
 
@@ -700,6 +784,7 @@ class P2PDownloader {
         dc.send(chunkData.slice(offset, end));
         offset = end;
       }
+      this.log(`WebRTC 上傳送出 chunk_complete: 區塊 ${chunkIndex}，總計 ${chunkData.length} bytes → 端點 ${targetPeer.slice(0, 8)}...`);
       dc.send(JSON.stringify({ type: 'chunk_complete', chunk_index: chunkIndex }));
     };
     sendSlice();
@@ -779,6 +864,7 @@ class P2PDownloader {
     });
 
     this.log(`區塊 ${chunkIndex}/${dl.totalChunks} 完成 ✓ (${dl.ownedChunks.size}/${dl.totalChunks})`);
+    this.uiLog(`區塊 ${chunkIndex} 下載完成（${dl.ownedChunks.size}/${dl.totalChunks}）`);
     this._notifyStateChange();
 
     // 通知中控新的完成狀態，觸發配對掃描
@@ -829,6 +915,9 @@ class P2PDownloader {
           this.log(`WebRTC 下載送出接收確認: 區塊 ${chunkIndex} → 來源端 ${sourcePeer.slice(0, 8)}...`);
           conn.dc.send(JSON.stringify({ type: 'chunk_received', chunk_index: chunkIndex }));
         }
+        this.log(`WebRTC 下載關閉連線: 區塊 ${chunkIndex}，來源端 ${sourcePeer.slice(0, 8)}...`);
+        conn.pc.close();
+        this.peerConnections.delete(key);
       }
       this.downloadCount = Math.max(0, this.downloadCount - 1);
       this.webrtcDownloadCount = Math.max(0, this.webrtcDownloadCount - 1);
@@ -840,6 +929,7 @@ class P2PDownloader {
     });
 
     this.log(`區塊 ${chunkIndex}/${dl.totalChunks} 完成 ✓ (${dl.ownedChunks.size}/${dl.totalChunks})`);
+    this.uiLog(`區塊 ${chunkIndex} 下載完成（${dl.ownedChunks.size}/${dl.totalChunks}）`);
     this._notifyStateChange();
     this._requestNextChunks();
   }
@@ -854,6 +944,7 @@ class P2PDownloader {
     }
     const elapsed = ((Date.now() - dl.startTime) / 1000).toFixed(1);
     this.log(`下載完成! 耗時 ${elapsed} 秒`);
+    this.uiLog(`檔案下載完成，耗時 ${elapsed} 秒`);
     this.completedFiles.add(dl.fileId);
     // 下載完成後清除該檔案的快取，轉為從磁碟讀取
     this.chunkBuffers.delete(dl.fileId);
