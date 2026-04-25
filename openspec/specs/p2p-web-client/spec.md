@@ -7,9 +7,17 @@
 - **WHEN** 使用者點擊下載按鈕
 - **THEN** 觸發 `showSaveFilePicker()`，待使用者選定路徑與授權後，再開始下載流程。
 
-### Requirement: 隨機區塊請求
-網頁客戶端 MUST 根據自身缺少的區塊清單，隨機挑選一個區塊向中控中心發出下載請求。
+### Requirement: 被動下載指派
+網頁客戶端不再主動挑選區塊，而是 MUST 監聽並執行來自中控中心的下載指派指令 (`SuggestDownload`)。
 
-#### Scenario: 發出區塊請求
-- **WHEN** 客戶端準備下載下一個區塊
-- **THEN** 從尚未擁有的區塊清單中亂數選擇一個索引，並發送請求至中控中心。
+#### Scenario: 執行下載指令
+- **WHEN** 收到 `SuggestDownload` 訊息
+- **THEN** 根據訊息中的 `source_peer` 決定是透過 HTTP (從 Host) 或是 WebRTC (從 Peer) 進行區塊下載。
+
+### Requirement: 下載佇列管理
+網頁客戶端 MUST 支援多個檔案的下載排程，並依序執行。
+
+#### Scenario: 多檔案下載排隊
+- **WHEN** 在已有進行中的下載任務時，使用者點擊另一個檔案的下載
+- **THEN** 將新任務加入 `downloadQueue`，待當前任務完成或取消後自動啟動。
+
