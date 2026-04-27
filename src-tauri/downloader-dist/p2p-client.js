@@ -239,7 +239,8 @@ class P2PDownloader {
         fileHandle: handle,
         writable: null,
         totalChunks: file.chunk_count,
-        startTime: null
+        startTime: null,
+        writeChain: Promise.resolve()
       };
 
       this.downloadQueue.push(downloadTask);
@@ -544,6 +545,9 @@ class P2PDownloader {
           }
           return this.activeDownload.writable.write({ type: 'write', position, data: payload });
         });
+        if (this.activeDownload) {
+          this.activeDownload.writeChain = writeChain;
+        }
         lastProgressAt = Date.now();
       };
 
@@ -964,13 +968,32 @@ class P2PDownloader {
   async _finalizeDownload() {
     if (!this.activeDownload) return;
     const dl = this.activeDownload;
+
+    // ✅ 第一步：等待所有未決議的 write 操作
+    const writeChainStart = Date.now();
+    try {
+      if (dl.writeChain) {
+        await dl.writeChain;
+      }
+    } catch (e) {
+      this.log(`writeChain 等待失敗: ${e.message}`);
+    }
+    const writeChainDuration = Date.now() - writeChainStart;
+    this.log(`writeChain 等待耗時: ${writeChainDuration}ms`);
+
+    // ✅ 第二步：測量 close() 本身的耗時
+    const closeStart = Date.now();
     try {
       await dl.writable.close();
     } catch (e) {
       this.log(`關閉檔案失敗: ${e.message}`);
     }
+    const closeDuration = Date.now() - closeStart;
+    this.log(`writable.close() 耗時: ${closeDuration}ms`);
+
     const elapsed = ((Date.now() - dl.startTime) / 1000).toFixed(1);
-    this.log(`下載完成! 耗時 ${elapsed} 秒`);
+    const totalFinalizeDuration = Date.now() - writeChainStart;
+    this.log(`下載完成! 總耗時 ${elapsed} 秒 (writeChain=${writeChainDuration}ms, close=${closeDuration}ms, total_finalize=${totalFinalizeDuration}ms)`);
     this.uiLog(`檔案下載完成，耗時 ${elapsed} 秒`);
     this.completedFiles.add(dl.fileId);
     // 下載完成後清除該檔案的快取，轉為從磁碟讀取
