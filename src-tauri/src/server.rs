@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, UdpSocket};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -24,6 +24,14 @@ fn local_ip() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
     socket.local_addr().ok().map(|a| a.ip().to_string())
+}
+
+/// 高精度時間碼（Unix epoch 秒.微秒），便於跨端比對事件先後
+fn log_timestamp() -> String {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => format!("{}.{:06}", d.as_secs(), d.subsec_micros()),
+        Err(_) => "0.000000".to_string(),
+    }
 }
 
 // ── WebSocket P2P 訊息格式定義 ──
@@ -617,7 +625,8 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
                 }
 
                 println!(
-                    "[配對] 來源端點冷卻: src={} requester={} file={} chunk={} reason={}",
+                    "[配對] ts={} 來源端點冷卻: src={} requester={} file={} chunk={} reason={}",
+                    log_timestamp(),
                     &source_peer[..8.min(source_peer.len())],
                     &endpoint_id[..8.min(endpoint_id.len())],
                     &file_id[..8.min(file_id.len())],
@@ -932,7 +941,8 @@ async fn host_http_dispatch(state: &ServerState) {
             }
 
             println!(
-                "[HTTP輪轉] 檔案={} 片段={} → {}",
+                "[HTTP輪轉] ts={} 檔案={} 片段={} → {}",
+                log_timestamp(),
                 &file_id[..8.min(file_id.len())],
                 chunk_idx,
                 &ep_id[..8.min(ep_id.len())]
@@ -1106,7 +1116,8 @@ async fn find_and_assign_matches(state: &ServerState) {
                 source_peer: c.source_id.clone(),
             });
             println!(
-                "[WebRTC配對] 檔案={} 片段={} | {} <- {}（src持有={} dst進度={}）",
+                "[WebRTC配對] ts={} 檔案={} 片段={} | {} <- {}（src持有={} dst進度={}）",
+                log_timestamp(),
                 &c.file_id[..8.min(c.file_id.len())],
                 c.chunk_idx,
                 &c.downloader_id[..8.min(c.downloader_id.len())],
