@@ -272,10 +272,10 @@ async fn get_chunk_data(
         }
     };
 
-    // 僅允許下載端取得「中控指派且尚未開始」的 HTTP 區塊，避免同端點多重並發
+    // 僅允許下載端取得「中控指派且尚未開始」的 HTTP 區塊
     {
         let mut s = state.p2p_state.write().await;
-        let Some(assignment) = s.http_assignments.get_mut(&endpoint_id) else {
+        let Some(assignments) = s.http_assignments.get_mut(&endpoint_id) else {
             return (
                 StatusCode::CONFLICT,
                 "no active host HTTP assignment for this endpoint",
@@ -283,13 +283,16 @@ async fn get_chunk_data(
                 .into_response();
         };
 
-        if assignment.file_id != file_id || assignment.chunk_index != chunk_index {
+        let Some(assignment) = assignments
+            .iter_mut()
+            .find(|a| a.file_id == file_id && a.chunk_index == chunk_index)
+        else {
             return (
                 StatusCode::CONFLICT,
                 "requested chunk does not match current host HTTP assignment",
             )
                 .into_response();
-        }
+        };
 
         if assignment.started {
             return (
@@ -521,8 +524,9 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
                 }
 
                 // Host HTTP 指派僅在下載端回報完成該片段後才釋放，避免寫入尚未完成就重複分派。
-                if let Some(assignment) = s.http_assignments.get(&eid) {
-                    if assignment.file_id == file_id && assignment.chunk_index == chunk_index {
+                if let Some(assignments) = s.http_assignments.get_mut(&eid) {
+                    assignments.retain(|a| !(a.file_id == file_id && a.chunk_index == chunk_index));
+                    if assignments.is_empty() {
                         s.http_assignments.remove(&eid);
                     }
                 }
@@ -617,8 +621,10 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
                 } else if source_peer == host_id {
                     // Host HTTP 來源失敗時，釋放該端點的 HTTP 指派，讓中控可重新分派。
                     let mut s = state.p2p_state.write().await;
-                    if let Some(assignment) = s.http_assignments.get(&endpoint_id) {
-                        if assignment.file_id == file_id && assignment.chunk_index == chunk_index {
+                    if let Some(assignments) = s.http_assignments.get_mut(&endpoint_id) {
+                        assignments
+                            .retain(|a| !(a.file_id == file_id && a.chunk_index == chunk_index));
+                        if assignments.is_empty() {
                             s.http_assignments.remove(&endpoint_id);
                         }
                     }
@@ -769,7 +775,7 @@ pub async fn send_file_chunks_info(state: &ServerState, endpoint_id: &str, file_
 /// Host 端 HTTP 輪轉分配：依序給每個下載端不同的片段（游標式平均分散）
 ///
 /// 規則：
-/// - 同一時間 host 只會指派一個下載端進行 HTTP 下載
+/// - 同一時間 host 最多指派兩條 HTTP 下載
 /// - 每個檔案維護一個全域游標，指向「下一個要由 host 分發」的片段
 /// - 依序掃描各下載端；若端點已有游標位置的片段則跳過（游標不動）
 /// - 若端點缺少游標位置的片段則指派，並將游標前進一格
@@ -779,6 +785,8 @@ pub async fn send_file_chunks_info(state: &ServerState, endpoint_id: &str, file_
 async fn host_http_dispatch(state: &ServerState) {
     const HTTP_ASSIGNMENT_TTL: Duration = Duration::from_secs(30);
     const HTTP_STARTED_ASSIGNMENT_TTL: Duration = Duration::from_secs(300);
+    const MAX_HOST_HTTP_CONNECTIONS: usize = 2;
+    const MAX_HTTP_ASSIGNMENTS_PER_ENDPOINT: usize = 2;
 
     let mut to_assign: Vec<(String, String, u32)> = Vec::new();
     let host_id;
@@ -790,29 +798,30 @@ async fn host_http_dispatch(state: &ServerState) {
         let now = Instant::now();
         let endpoint_ids: HashSet<String> = s.endpoints.keys().cloned().collect();
         s.http_assignments.retain(|endpoint_id, assignment| {
-            endpoint_ids.contains(endpoint_id)
-                && now.duration_since(assignment.assigned_at)
-                    <= if assignment.started {
-                        HTTP_STARTED_ASSIGNMENT_TTL
-                    } else {
-                        HTTP_ASSIGNMENT_TTL
-                    }
+            endpoint_ids.contains(endpoint_id) && {
+                assignment.retain(|a| {
+                    now.duration_since(a.assigned_at)
+                        <= if a.started {
+                            HTTP_STARTED_ASSIGNMENT_TTL
+                        } else {
+                            HTTP_ASSIGNMENT_TTL
+                        }
+                });
+                !assignment.is_empty()
+            }
         });
 
-        // Host HTTP 同時間僅允許一個下載端執行，若已有任務則本輪不再派發。
-        if !s.http_assignments.is_empty() {
-            // if let Some((ep_id, assignment)) = s.http_assignments.iter().next() {
-            // println!(
-            //     "[HTTP分派統計] 略過新指派: in_flight={} endpoint={} file={} chunk={} started={}",
-            //     s.http_assignments.len(),
-            //     &ep_id[..8.min(ep_id.len())],
-            //     &assignment.file_id[..8.min(assignment.file_id.len())],
-            //     assignment.chunk_index,
-            //     assignment.started
-            // );
-            // }
+        let in_flight_assignments = s
+            .http_assignments
+            .values()
+            .map(std::vec::Vec::len)
+            .sum::<usize>();
+
+        if in_flight_assignments >= MAX_HOST_HTTP_CONNECTIONS {
             return;
         }
+
+        let remaining_slots = MAX_HOST_HTTP_CONNECTIONS - in_flight_assignments;
 
         // 先收集所有需要的資料（避免借用衝突）
         let file_ids: Vec<String> = s.shared_files.iter().map(|f| f.file_id.clone()).collect();
@@ -826,94 +835,111 @@ async fn host_http_dispatch(state: &ServerState) {
             .map(|f| (f.file_id.clone(), f.chunk_count))
             .collect();
 
-        let mut assigned_one = false;
+        for _ in 0..remaining_slots {
+            let mut assigned_one = false;
 
-        for file_id in &file_ids {
-            let chunk_count = match chunk_counts.get(file_id) {
-                Some(&c) if c > 0 => c,
-                _ => continue,
-            };
+            for file_id in &file_ids {
+                let chunk_count = match chunk_counts.get(file_id) {
+                    Some(&c) if c > 0 => c,
+                    _ => continue,
+                };
 
-            // 1. 取得正在下載此檔案且缺片的端點
-            let mut active_downloaders: Vec<(String, HashSet<u32>)> = s
-                .endpoints
-                .iter()
-                .filter(|(id, ep)| {
-                    *id != &host_id
-                        && ep.file_id.as_deref() == Some(file_id.as_str())
-                        && ep
-                            .owned_chunks
-                            .get(file_id)
-                            .map_or(true, |chunks| chunks.len() < chunk_count as usize)
-                        && !s.http_assignments.contains_key(id.as_str())
-                })
-                .map(|(id, ep)| {
-                    let owned = ep.owned_chunks.get(file_id).cloned().unwrap_or_default();
-                    (id.clone(), owned)
-                })
-                .collect();
-
-            if active_downloaders.is_empty() {
-                continue;
-            }
-
-            // 按 ID 排序確保穩定順序，以便輪轉
-            active_downloaders.sort_by(|a, b| a.0.cmp(&b.0));
-
-            // 2. 決定下一個該獲得分派的端點 (Round-robin 端點)
-            let last_ep = s.file_last_http_endpoint.get(file_id);
-            let start_idx = if let Some(last_id) = last_ep {
-                active_downloaders
+                // 1. 取得正在下載此檔案且缺片的端點
+                let mut active_downloaders: Vec<(String, HashSet<u32>)> = s
+                    .endpoints
                     .iter()
-                    .position(|(id, _)| id == last_id)
-                    .map(|pos| (pos + 1) % active_downloaders.len())
-                    .unwrap_or(0)
-            } else {
-                0
-            };
+                    .filter(|(id, ep)| {
+                        *id != &host_id
+                            && ep.file_id.as_deref() == Some(file_id.as_str())
+                            && ep
+                                .owned_chunks
+                                .get(file_id)
+                                .map_or(true, |chunks| chunks.len() < chunk_count as usize)
+                            && s.http_assignments
+                                .get(id.as_str())
+                                .map_or(0, std::vec::Vec::len)
+                                < MAX_HTTP_ASSIGNMENTS_PER_ENDPOINT
+                    })
+                    .map(|(id, ep)| {
+                        let owned = ep.owned_chunks.get(file_id).cloned().unwrap_or_default();
+                        (id.clone(), owned)
+                    })
+                    .collect();
 
-            // 3. 從目標端點出發，尋找該端點最需要的片段 (優先參考檔案游標)
-            let cursor = *s.file_chunk_cursors.entry(file_id.clone()).or_insert(0);
+                if active_downloaders.is_empty() {
+                    continue;
+                }
 
-            for i in 0..active_downloaders.len() {
-                let target_idx = (start_idx + i) % active_downloaders.len();
-                let (ep_id, owned) = &active_downloaders[target_idx];
+                // 按 ID 排序確保穩定順序，以便輪轉
+                active_downloaders.sort_by(|a, b| a.0.cmp(&b.0));
 
-                let mut selected_chunk: Option<u32> = None;
-                // 從游標開始，找第一個該端點還沒有的片段
-                for offset in 0..chunk_count {
-                    let candidate = (cursor + offset) % chunk_count;
-                    if !owned.contains(&candidate) {
-                        selected_chunk = Some(candidate);
+                // 2. 決定下一個該獲得分派的端點 (Round-robin 端點)
+                let last_ep = s.file_last_http_endpoint.get(file_id);
+                let start_idx = if let Some(last_id) = last_ep {
+                    active_downloaders
+                        .iter()
+                        .position(|(id, _)| id == last_id)
+                        .map(|pos| (pos + 1) % active_downloaders.len())
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+
+                // 3. 從目標端點出發，尋找該端點最需要的片段 (優先參考檔案游標)
+                let cursor = *s.file_chunk_cursors.entry(file_id.clone()).or_insert(0);
+
+                for i in 0..active_downloaders.len() {
+                    let target_idx = (start_idx + i) % active_downloaders.len();
+                    let (ep_id, owned) = &active_downloaders[target_idx];
+
+                    let mut selected_chunk: Option<u32> = None;
+                    // 從游標開始，找第一個該端點還沒有的片段
+                    for offset in 0..chunk_count {
+                        let candidate = (cursor + offset) % chunk_count;
+                        if !owned.contains(&candidate) {
+                            selected_chunk = Some(candidate);
+                            break;
+                        }
+                    }
+
+                    if let Some(chunk_idx) = selected_chunk {
+                        // 避免重複對同端點指派同一片段
+                        if s.http_assignments.get(ep_id).map_or(false, |assignments| {
+                            assignments
+                                .iter()
+                                .any(|a| a.file_id == *file_id && a.chunk_index == chunk_idx)
+                        }) {
+                            continue;
+                        }
+
+                        // 執行指派
+                        to_assign.push((ep_id.clone(), file_id.clone(), chunk_idx));
+                        s.file_last_http_endpoint
+                            .insert(file_id.clone(), ep_id.clone());
+                        s.http_assignments.entry(ep_id.clone()).or_default().push(
+                            p2p::HttpChunkAssignment {
+                                file_id: file_id.clone(),
+                                chunk_index: chunk_idx,
+                                started: false,
+                                assigned_at: now,
+                            },
+                        );
+
+                        // 更新檔案游標：下一次從這片之後開始找，增加片段多樣性
+                        s.file_chunk_cursors
+                            .insert(file_id.clone(), (chunk_idx + 1) % chunk_count);
+
+                        assigned_one = true;
                         break;
                     }
                 }
 
-                if let Some(chunk_idx) = selected_chunk {
-                    // 執行指派
-                    to_assign.push((ep_id.clone(), file_id.clone(), chunk_idx));
-                    s.file_last_http_endpoint
-                        .insert(file_id.clone(), ep_id.clone());
-                    s.http_assignments.insert(
-                        ep_id.clone(),
-                        p2p::HttpChunkAssignment {
-                            file_id: file_id.clone(),
-                            chunk_index: chunk_idx,
-                            started: false,
-                            assigned_at: now,
-                        },
-                    );
-
-                    // 更新檔案游標：下一次從這片之後開始找，增加片段多樣性
-                    s.file_chunk_cursors
-                        .insert(file_id.clone(), (chunk_idx + 1) % chunk_count);
-
-                    assigned_one = true;
+                if assigned_one {
                     break;
                 }
             }
 
-            if assigned_one {
+            if !assigned_one {
                 break;
             }
         }
