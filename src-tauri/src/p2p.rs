@@ -54,7 +54,7 @@ pub struct EndpointState {
     pub download_count: u32,
 }
 
-/// Host HTTP 指派狀態（每個端點同時最多一個）
+/// Host HTTP 指派狀態
 #[derive(Debug, Clone)]
 pub struct HttpChunkAssignment {
     /// 被指派下載的檔案
@@ -82,8 +82,8 @@ pub struct P2PState {
     pub file_chunk_cursors: HashMap<String, u32>,
     /// Host HTTP 最近一次被指派端點：key = file_id，value = endpoint_id
     pub file_last_http_endpoint: HashMap<String, String>,
-    /// Host HTTP 指派（key = endpoint_id），限制同端點同時只能一個 HTTP 下載
-    pub http_assignments: HashMap<String, HttpChunkAssignment>,
+    /// Host HTTP 指派（key = endpoint_id）
+    pub http_assignments: HashMap<String, Vec<HttpChunkAssignment>>,
 }
 
 impl P2PState {
@@ -218,8 +218,10 @@ pub async fn remove_shared_file(state: &SharedState, file_path: &str) {
         s.shared_files.remove(pos);
         s.file_chunk_cursors.remove(&file_id);
         s.file_last_http_endpoint.remove(&file_id);
-        s.http_assignments
-            .retain(|_, assignment| assignment.file_id != file_id);
+        s.http_assignments.retain(|_, assignments| {
+            assignments.retain(|assignment| assignment.file_id != file_id);
+            !assignments.is_empty()
+        });
         // 清除各端點的相關區塊
         for ep in s.endpoints.values_mut() {
             ep.owned_chunks.remove(&file_id);

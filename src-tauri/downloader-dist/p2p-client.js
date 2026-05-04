@@ -30,6 +30,7 @@ const CRC32 = (() => {
 const WEBRTC_CHUNK_IDLE_TIMEOUT_MS = 30000;
 const WEBRTC_TIMEOUT_CHECK_INTERVAL_MS = 1000;
 const CHUNK_SIZE = 50 * 1024 * 1024;
+const MAX_HTTP_IN_FLIGHT = 2;
 
 // ── P2P 下載管理器 ──
 class P2PDownloader {
@@ -370,10 +371,10 @@ class P2PDownloader {
 
   _drainHttpQueue() {
     if (!this.activeDownload) return;
-    // 同端點同時間只允許一條 host HTTP 下載
-    if (this.httpInFlight.size > 0) return;
+    // 同端點同時間最多允許兩條 host HTTP 下載
+    if (this.httpInFlight.size >= MAX_HTTP_IN_FLIGHT) return;
 
-    while (this.httpQueue.length > 0) {
+    while (this.httpQueue.length > 0 && this.httpInFlight.size < MAX_HTTP_IN_FLIGHT) {
       const task = this.httpQueue.shift();
       if (!task) return;
       if (!this.activeDownload || this.activeDownload.fileId !== task.fileId) {
@@ -388,7 +389,6 @@ class P2PDownloader {
         continue;
       }
       this._downloadChunkViaHttp(task.fileId, task.chunkIndex, task.sourcePeer);
-      return;
     }
   }
 
