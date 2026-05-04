@@ -31,6 +31,8 @@ const WEBRTC_CHUNK_IDLE_TIMEOUT_MS = 30000;
 const WEBRTC_TIMEOUT_CHECK_INTERVAL_MS = 1000;
 const CHUNK_SIZE = 50 * 1024 * 1024;
 const MAX_HTTP_IN_FLIGHT = 2;
+const MAX_WEBRTC_UPLOAD_CONNECTIONS = 2;
+const MAX_WEBRTC_DOWNLOAD_CONNECTIONS = 2;
 
 // ── P2P 下載管理器 ──
 class P2PDownloader {
@@ -344,6 +346,21 @@ class P2PDownloader {
     if (!this.activeDownload || this.activeDownload.fileId !== file_id) return;
     if (this.activeDownload.ownedChunks.has(chunk_index)) return; // 已擁有此分片
     if (this.pendingRequests.has(chunk_index)) return; // 已在下載中，忽略重複指派
+
+    const isWebRtcSource =
+      source_peer !== this.hostEndpointId && source_peer !== 'host' && !!source_peer;
+    if (isWebRtcSource && this.webrtcDownloadCount >= MAX_WEBRTC_DOWNLOAD_CONNECTIONS) {
+      this.log(`忽略中控指派（下載容量已滿）: 區塊 ${chunk_index}, 來源 ${source_peer.slice(0, 8)}...`);
+      this._send({
+        type: 'transfer_failed',
+        endpoint_id: this.endpointId,
+        file_id,
+        chunk_index,
+        source_peer,
+        reason: 'download_capacity_full'
+      });
+      return;
+    }
 
     this.log(`中控指令: 區塊 ${chunk_index} 來自 ${source_peer.slice(0, 8)}...`);
     this.uiLog(`下載區塊 ${chunk_index}：來源端點 ${source_peer.slice(0, 8)}...`);
@@ -700,6 +717,10 @@ class P2PDownloader {
     const { file_id, chunk_index, sdp } = signal;
     const hasChunk = this._hasChunkForUpload(file_id, chunk_index);
     if (!hasChunk) return;
+    if (this.uploadCount >= MAX_WEBRTC_UPLOAD_CONNECTIONS) {
+      this.log(`拒絕上傳 offer（上傳容量已滿）: 區塊 ${chunk_index} <- ${from.slice(0, 8)}...`);
+      return;
+    }
     const key = `${from}-${chunk_index}`;
 
     this.uploadCount++;
@@ -775,13 +796,25 @@ class P2PDownloader {
       };
     };
 
-    await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp }));
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    this._send({
-      type: 'webrtc_signal', from: this.endpointId, to: from,
-      signal: { type: 'answer', sdp: answer.sdp, file_id, chunk_index }
-    });
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp }));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      this._send({
+        type: 'webrtc_signal', from: this.endpointId, to: from,
+        signal: { type: 'answer', sdp: answer.sdp, file_id, chunk_index }
+      });
+    } catch (e) {
+      this.log(`建立上傳連線失敗: 區塊 ${chunk_index}, error=${e.message}`);
+      const conn = this.peerConnections.get(key);
+      if (conn) {
+        conn.pc.close();
+        this.peerConnections.delete(key);
+      }
+      this.uploadCount = Math.max(0, this.uploadCount - 1);
+      this._notifyStateChange();
+      this._send({ type: 'transfer_finished', endpoint_id: this.endpointId, file_id, chunk_index, is_upload: true });
+    }
   }
 
   // ── 背壓控制發送 ──
