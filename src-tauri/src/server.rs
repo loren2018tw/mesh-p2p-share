@@ -997,9 +997,6 @@ async fn host_http_dispatch(state: &ServerState) {
 /// - 不使用 host 作為 WebRTC 來源（host 透過 host_http_dispatch 獨立處理）
 /// - 冷卻中的不穩定來源端點排除在外
 async fn find_and_assign_matches(state: &ServerState) {
-    const MAX_UPLOAD_CONNECTIONS: u32 = 2;
-    const MAX_DOWNLOAD_CONNECTIONS: u32 = 2;
-
     #[derive(Clone)]
     struct Assignment {
         downloader_id: String,
@@ -1019,6 +1016,8 @@ async fn find_and_assign_matches(state: &ServerState) {
 
     let s = state.p2p_state.read().await;
     let host_id = s.host_endpoint_id.clone();
+    let max_upload = s.webrtc_max_upload;
+    let max_download = s.webrtc_max_download;
     let file_chunk_counts: HashMap<String, u32> = s
         .shared_files
         .iter()
@@ -1031,8 +1030,8 @@ async fn find_and_assign_matches(state: &ServerState) {
         &file_chunk_counts,
         &cooldown_snapshot,
         now,
-        MAX_UPLOAD_CONNECTIONS,
-        MAX_DOWNLOAD_CONNECTIONS,
+        max_upload,
+        max_download,
     )
     .into_iter()
     .map(|assignment| Assignment {
@@ -1096,9 +1095,9 @@ fn select_webrtc_assignments(
         .collect();
     endpoint_ids.sort();
 
-    // 每輪每個來源端點最多指派一筆，避免單一來源壟斷。
+    // 每輪記錄每個下載端已被指派筆數，最多允許 max_download_connections 筆同時。
     let mut to_assign: Vec<MatchAssignment> = Vec::new();
-    let mut assigned_downloaders: HashSet<String> = HashSet::new();
+    let mut assigned_downloaders: HashMap<String, u32> = HashMap::new();
 
     for source_id in &endpoint_ids {
         let Some(source_ep) = endpoints.get(source_id) else {
@@ -1117,7 +1116,13 @@ fn select_webrtc_assignments(
         }
 
         for downloader_id in &endpoint_ids {
-            if downloader_id == source_id || assigned_downloaders.contains(downloader_id) {
+            if downloader_id == source_id
+                || assigned_downloaders
+                    .get(downloader_id)
+                    .copied()
+                    .unwrap_or(0)
+                    >= max_download_connections
+            {
                 continue;
             }
 
@@ -1174,7 +1179,9 @@ fn select_webrtc_assignments(
                 continue;
             };
 
-            assigned_downloaders.insert(downloader_id.clone());
+            *assigned_downloaders
+                .entry(downloader_id.clone())
+                .or_insert(0) += 1;
             to_assign.push(MatchAssignment {
                 downloader_id: downloader_id.clone(),
                 file_id: file_id.clone(),

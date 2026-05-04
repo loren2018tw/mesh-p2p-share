@@ -119,6 +119,18 @@ async fn get_app_stats(state: State<'_, AppState>) -> Result<AppStats, String> {
     })
 }
 
+#[tauri::command]
+async fn set_webrtc_limits(
+    state: State<'_, AppState>,
+    max_upload: u32,
+    max_download: u32,
+) -> Result<(), String> {
+    let mut s = state.p2p_state.write().await;
+    s.webrtc_max_upload = max_upload;
+    s.webrtc_max_download = max_download;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let host_id = uuid::Uuid::new_v4().to_string();
@@ -143,7 +155,8 @@ pub fn run() {
             get_service_url,
             get_file_size,
             get_app_version,
-            get_app_stats
+            get_app_stats,
+            set_webrtc_limits
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();

@@ -34,6 +34,8 @@ const snackbar = ref(false);
 const snackbarText = ref("");
 const snackbarColor = ref("success");
 const sharedFiles = ref<SharedFile[]>([]);
+const webrtcMaxUpload = ref(2);
+const webrtcMaxDownload = ref(2);
 const appStats = ref<AppStats>({
   connected_peers: 0,
   downloading_peers: 0,
@@ -158,6 +160,20 @@ async function removeFile(path: string) {
   notify("已移除分享檔案", "info");
 }
 
+async function applyWebrtcLimits() {
+  try {
+    await invoke("set_webrtc_limits", {
+      maxUpload: webrtcMaxUpload.value,
+      maxDownload: webrtcMaxDownload.value,
+    });
+    notify(
+      `WebRTC 限制已更新：上傳 ${webrtcMaxUpload.value} / 下載 ${webrtcMaxDownload.value}`,
+    );
+  } catch (e: any) {
+    notify(`設定失敗：${e}`, "error");
+  }
+}
+
 onMounted(async () => {
   loadServiceUrl();
   loadAppStats();
@@ -179,7 +195,9 @@ onMounted(async () => {
       </v-app-bar-title>
       <template #append>
         <div class="d-flex align-center text-caption text-white mr-4">
-          <span class="mr-2">v{{ appVersion }} by Loren(loren.tw@gmail.com)</span>
+          <span class="mr-2"
+            >v{{ appVersion }} by Loren(loren.tw@gmail.com)</span
+          >
           <v-btn
             icon="mdi-github"
             variant="text"
@@ -333,9 +351,15 @@ onMounted(async () => {
                         </v-avatar>
                       </template>
 
-                      <div class="d-flex align-center justify-space-between w-100">
-                        <div class="d-flex align-center flex-grow-1 text-truncate">
-                          <span class="font-weight-medium text-truncate mr-3">{{ file.name }}</span>
+                      <div
+                        class="d-flex align-center justify-space-between w-100"
+                      >
+                        <div
+                          class="d-flex align-center flex-grow-1 text-truncate"
+                        >
+                          <span class="font-weight-medium text-truncate mr-3">{{
+                            file.name
+                          }}</span>
                           <template v-if="file.processing">
                             <v-progress-linear
                               indeterminate
@@ -345,10 +369,15 @@ onMounted(async () => {
                               class="flex-grow-1 mx-2"
                               style="max-width: 100px"
                             ></v-progress-linear>
-                            <span class="text-caption text-medium-emphasis">處理中...</span>
+                            <span class="text-caption text-medium-emphasis"
+                              >處理中...</span
+                            >
                           </template>
                         </div>
-                        <div v-if="!file.processing" class="text-caption text-medium-emphasis ml-4 flex-shrink-0">
+                        <div
+                          v-if="!file.processing"
+                          class="text-caption text-medium-emphasis ml-4 flex-shrink-0"
+                        >
                           {{ file.size }} · {{ file.chunk_count }} 個區塊
                         </div>
                       </div>
@@ -404,38 +433,124 @@ onMounted(async () => {
                 <v-list density="compact" bg-color="transparent">
                   <v-list-item>
                     <template #prepend>
-                      <v-icon icon="mdi-lan-connect" color="primary" class="mr-2" />
+                      <v-icon
+                        icon="mdi-lan-connect"
+                        color="primary"
+                        class="mr-2"
+                      />
                     </template>
                     <v-list-item-title>目前連線終端數</v-list-item-title>
                     <template #append>
-                      <v-chip size="small" color="primary" variant="tonal" class="font-weight-bold">
+                      <v-chip
+                        size="small"
+                        color="primary"
+                        variant="tonal"
+                        class="font-weight-bold"
+                      >
                         {{ appStats.connected_peers }}
                       </v-chip>
                     </template>
                   </v-list-item>
                   <v-list-item>
                     <template #prepend>
-                      <v-icon icon="mdi-upload-network" color="success" class="mr-2" />
+                      <v-icon
+                        icon="mdi-upload-network"
+                        color="success"
+                        class="mr-2"
+                      />
                     </template>
                     <v-list-item-title>目前分享中 (Seed)</v-list-item-title>
                     <template #append>
-                      <v-chip size="small" color="success" variant="tonal" class="font-weight-bold">
+                      <v-chip
+                        size="small"
+                        color="success"
+                        variant="tonal"
+                        class="font-weight-bold"
+                      >
                         {{ appStats.sharing_peers }}
                       </v-chip>
                     </template>
                   </v-list-item>
                   <v-list-item>
                     <template #prepend>
-                      <v-icon icon="mdi-download-network" color="info" class="mr-2" />
+                      <v-icon
+                        icon="mdi-download-network"
+                        color="info"
+                        class="mr-2"
+                      />
                     </template>
                     <v-list-item-title>目前下載中 (Leech)</v-list-item-title>
                     <template #append>
-                      <v-chip size="small" color="info" variant="tonal" class="font-weight-bold">
+                      <v-chip
+                        size="small"
+                        color="info"
+                        variant="tonal"
+                        class="font-weight-bold"
+                      >
                         {{ appStats.downloading_peers }}
                       </v-chip>
                     </template>
                   </v-list-item>
                 </v-list>
+              </v-card-text>
+            </v-card>
+
+            <!-- ── WebRTC 傳輸設定 Card ── -->
+            <v-card elevation="2" rounded="lg" class="mb-5">
+              <v-card-item class="pt-5 pb-2">
+                <template #prepend>
+                  <v-avatar color="warning" variant="tonal" size="44">
+                    <v-icon icon="mdi-tune" />
+                  </v-avatar>
+                </template>
+                <v-card-title class="text-h6 font-weight-bold section-title">
+                  傳輸設定
+                </v-card-title>
+                <v-card-subtitle class="mt-1">
+                  設定下載端 WebRTC 最大並行連線數
+                </v-card-subtitle>
+              </v-card-item>
+              <v-divider class="mx-4" />
+              <v-card-text class="pt-4 pb-3">
+                <v-row align="center" dense>
+                  <v-col cols="6">
+                    <v-text-field
+                      v-model.number="webrtcMaxUpload"
+                      label="最大上傳數"
+                      type="number"
+                      min="1"
+                      max="10"
+                      density="compact"
+                      variant="outlined"
+                      hide-details
+                      prepend-inner-icon="mdi-upload"
+                    />
+                  </v-col>
+                  <v-col cols="6">
+                    <v-text-field
+                      v-model.number="webrtcMaxDownload"
+                      label="最大下載數"
+                      type="number"
+                      min="1"
+                      max="10"
+                      density="compact"
+                      variant="outlined"
+                      hide-details
+                      prepend-inner-icon="mdi-download"
+                    />
+                  </v-col>
+                </v-row>
+                <v-btn
+                  color="warning"
+                  variant="tonal"
+                  rounded="pill"
+                  size="small"
+                  prepend-icon="mdi-check"
+                  class="mt-3"
+                  @click="applyWebrtcLimits"
+                >
+                  套用設定
+                </v-btn>
               </v-card-text>
             </v-card>
 
@@ -447,7 +562,8 @@ onMounted(async () => {
               class="text-caption"
               rounded="lg"
             >
-              本系統採用 P2P 網狀傳輸技術，下載端也會參與分享，連線人數越多下載速度越快。
+              本系統採用 P2P
+              網狀傳輸技術，下載端也會參與分享，連線人數越多下載速度越快。
             </v-alert>
           </v-col>
         </v-row>
@@ -456,18 +572,38 @@ onMounted(async () => {
 
     <!-- QR 放大 Dialog -->
     <v-dialog v-model="qrDialog" width="auto">
-      <v-card rounded="lg" class="text-center" style="max-width: 95vw; max-height: 95vh; display: flex; flex-direction: column;">
-        <v-card-title class="pt-6 text-h6 font-weight-bold section-title flex-shrink-0"
+      <v-card
+        rounded="lg"
+        class="text-center"
+        style="
+          max-width: 95vw;
+          max-height: 95vh;
+          display: flex;
+          flex-direction: column;
+        "
+      >
+        <v-card-title
+          class="pt-6 text-h6 font-weight-bold section-title flex-shrink-0"
           >掃描 QR Code</v-card-title
         >
-        <v-card-subtitle class="mb-2 flex-shrink-0">下載端掃描後即可連入</v-card-subtitle>
-        <v-card-text class="pb-5 d-flex justify-center align-center" style="overflow: hidden;">
+        <v-card-subtitle class="mb-2 flex-shrink-0"
+          >下載端掃描後即可連入</v-card-subtitle
+        >
+        <v-card-text
+          class="pb-5 d-flex justify-center align-center"
+          style="overflow: hidden"
+        >
           <img
             v-if="qrCodeDataUrl"
             :src="qrCodeDataUrl"
             alt="QR Code"
             class="qr-dialog-img"
-            style="max-width: 100%; max-height: 65vh; object-fit: contain; border-radius: 8px;"
+            style="
+              max-width: 100%;
+              max-height: 65vh;
+              object-fit: contain;
+              border-radius: 8px;
+            "
           />
         </v-card-text>
         <v-card-actions class="pb-4">
