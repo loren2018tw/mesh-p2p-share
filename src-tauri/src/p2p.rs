@@ -84,6 +84,10 @@ pub struct P2PState {
     pub file_last_http_endpoint: HashMap<String, String>,
     /// Host HTTP 指派（key = endpoint_id）
     pub http_assignments: HashMap<String, Vec<HttpChunkAssignment>>,
+    /// 下載端 WebRTC 最大上傳連線數（由分享端設定）
+    pub webrtc_max_upload: u32,
+    /// 下載端 WebRTC 最大下載連線數（由分享端設定）
+    pub webrtc_max_download: u32,
 }
 
 impl P2PState {
@@ -106,6 +110,8 @@ impl P2PState {
             file_chunk_cursors: HashMap::new(),
             file_last_http_endpoint: HashMap::new(),
             http_assignments: HashMap::new(),
+            webrtc_max_upload: 2,
+            webrtc_max_download: 2,
         }
     }
 
@@ -127,6 +133,8 @@ impl Default for P2PState {
             file_chunk_cursors: HashMap::new(),
             file_last_http_endpoint: HashMap::new(),
             http_assignments: HashMap::new(),
+            webrtc_max_upload: 2,
+            webrtc_max_download: 2,
         }
     }
 }

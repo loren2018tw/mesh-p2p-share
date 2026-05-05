@@ -772,15 +772,15 @@ pub async fn send_file_chunks_info(state: &ServerState, endpoint_id: &str, file_
     }
 }
 
-/// Host 端 HTTP 輪轉分配：依序給每個下載端不同的片段（游標式平均分散）
+/// Host 端 HTTP 分配：優先傳送給下載進度最慢的端點
 ///
 /// 規則：
 /// - 同一時間 host 最多指派兩條 HTTP 下載
-/// - 每個檔案維護一個全域游標，指向「下一個要由 host 分發」的片段
-/// - 依序掃描各下載端；若端點已有游標位置的片段則跳過（游標不動）
-/// - 若端點缺少游標位置的片段則指派，並將游標前進一格
-/// - 若有其他候選端點，避免同檔案連續指派給同一個端點
-/// - 此邏輯可確保各端點擁有的片段最分散
+/// - 先以「已擁有片段 / 總片段」由小到大排序（進度最慢優先）
+/// - 每輪補 slot 時都重新依最新狀態排序，因此會自然出現：
+///   1) 最慢的兩個端點各拿一條
+///   2) 或同一個最慢端點拿兩條
+/// - 每個檔案維護一個全域游標，指向下一個優先分發的片段
 /// - HTTP 下載不計入端點的下載連線數
 async fn host_http_dispatch(state: &ServerState) {
     const HTTP_ASSIGNMENT_TTL: Duration = Duration::from_secs(30);
@@ -836,107 +836,130 @@ async fn host_http_dispatch(state: &ServerState) {
             .collect();
 
         for _ in 0..remaining_slots {
+            #[derive(Clone)]
+            struct DownloaderCandidate {
+                endpoint_id: String,
+                file_id: String,
+                chunk_count: u32,
+                owned_count: u32,
+                owned_chunks: HashSet<u32>,
+                in_flight_http: usize,
+            }
+
+            // 收集可被 host HTTP 指派的下載端，並以「進度最慢」優先。
+            let mut candidates: Vec<DownloaderCandidate> = s
+                .endpoints
+                .iter()
+                .filter_map(|(id, ep)| {
+                    if *id == host_id {
+                        return None;
+                    }
+
+                    let file_id = ep.file_id.clone()?;
+                    let chunk_count = *chunk_counts.get(&file_id)?;
+                    if chunk_count == 0 {
+                        return None;
+                    }
+
+                    let owned_chunks = ep.owned_chunks.get(&file_id).cloned().unwrap_or_default();
+                    let owned_count = owned_chunks.len() as u32;
+                    if owned_count >= chunk_count {
+                        return None;
+                    }
+
+                    let in_flight_http = s
+                        .http_assignments
+                        .get(id.as_str())
+                        .map_or(0, std::vec::Vec::len);
+                    if in_flight_http >= MAX_HTTP_ASSIGNMENTS_PER_ENDPOINT {
+                        return None;
+                    }
+
+                    Some(DownloaderCandidate {
+                        endpoint_id: id.clone(),
+                        file_id,
+                        chunk_count,
+                        owned_count,
+                        owned_chunks,
+                        in_flight_http,
+                    })
+                })
+                .collect();
+
+            if candidates.is_empty() {
+                break;
+            }
+
+            // 進度最慢者優先：owned/chunk 較小者在前。
+            candidates.sort_by(|a, b| {
+                let lhs = (a.owned_count as u64) * (b.chunk_count as u64);
+                let rhs = (b.owned_count as u64) * (a.chunk_count as u64);
+
+                lhs.cmp(&rhs)
+                    .then_with(|| a.in_flight_http.cmp(&b.in_flight_http))
+                    .then_with(|| a.owned_count.cmp(&b.owned_count))
+                    .then_with(|| a.endpoint_id.cmp(&b.endpoint_id))
+            });
+
             let mut assigned_one = false;
 
-            for file_id in &file_ids {
-                let chunk_count = match chunk_counts.get(file_id) {
-                    Some(&c) if c > 0 => c,
-                    _ => continue,
-                };
+            for candidate in candidates {
+                let cursor = *s
+                    .file_chunk_cursors
+                    .entry(candidate.file_id.clone())
+                    .or_insert(0);
 
-                // 1. 取得正在下載此檔案且缺片的端點
-                let mut active_downloaders: Vec<(String, HashSet<u32>)> = s
-                    .endpoints
-                    .iter()
-                    .filter(|(id, ep)| {
-                        *id != &host_id
-                            && ep.file_id.as_deref() == Some(file_id.as_str())
-                            && ep
-                                .owned_chunks
-                                .get(file_id)
-                                .map_or(true, |chunks| chunks.len() < chunk_count as usize)
-                            && s.http_assignments
-                                .get(id.as_str())
-                                .map_or(0, std::vec::Vec::len)
-                                < MAX_HTTP_ASSIGNMENTS_PER_ENDPOINT
-                    })
-                    .map(|(id, ep)| {
-                        let owned = ep.owned_chunks.get(file_id).cloned().unwrap_or_default();
-                        (id.clone(), owned)
-                    })
-                    .collect();
-
-                if active_downloaders.is_empty() {
-                    continue;
-                }
-
-                // 按 ID 排序確保穩定順序，以便輪轉
-                active_downloaders.sort_by(|a, b| a.0.cmp(&b.0));
-
-                // 2. 決定下一個該獲得分派的端點 (Round-robin 端點)
-                let last_ep = s.file_last_http_endpoint.get(file_id);
-                let start_idx = if let Some(last_id) = last_ep {
-                    active_downloaders
-                        .iter()
-                        .position(|(id, _)| id == last_id)
-                        .map(|pos| (pos + 1) % active_downloaders.len())
-                        .unwrap_or(0)
-                } else {
-                    0
-                };
-
-                // 3. 從目標端點出發，尋找該端點最需要的片段 (優先參考檔案游標)
-                let cursor = *s.file_chunk_cursors.entry(file_id.clone()).or_insert(0);
-
-                for i in 0..active_downloaders.len() {
-                    let target_idx = (start_idx + i) % active_downloaders.len();
-                    let (ep_id, owned) = &active_downloaders[target_idx];
-
-                    let mut selected_chunk: Option<u32> = None;
-                    // 從游標開始，找第一個該端點還沒有的片段
-                    for offset in 0..chunk_count {
-                        let candidate = (cursor + offset) % chunk_count;
-                        if !owned.contains(&candidate) {
-                            selected_chunk = Some(candidate);
-                            break;
-                        }
+                let mut selected_chunk: Option<u32> = None;
+                for offset in 0..candidate.chunk_count {
+                    let chunk_idx = (cursor + offset) % candidate.chunk_count;
+                    if candidate.owned_chunks.contains(&chunk_idx) {
+                        continue;
                     }
 
-                    if let Some(chunk_idx) = selected_chunk {
-                        // 避免重複對同端點指派同一片段
-                        if s.http_assignments.get(ep_id).map_or(false, |assignments| {
-                            assignments
-                                .iter()
-                                .any(|a| a.file_id == *file_id && a.chunk_index == chunk_idx)
-                        }) {
-                            continue;
-                        }
-
-                        // 執行指派
-                        to_assign.push((ep_id.clone(), file_id.clone(), chunk_idx));
-                        s.file_last_http_endpoint
-                            .insert(file_id.clone(), ep_id.clone());
-                        s.http_assignments.entry(ep_id.clone()).or_default().push(
-                            p2p::HttpChunkAssignment {
-                                file_id: file_id.clone(),
-                                chunk_index: chunk_idx,
-                                started: false,
-                                assigned_at: now,
-                            },
-                        );
-
-                        // 更新檔案游標：下一次從這片之後開始找，增加片段多樣性
-                        s.file_chunk_cursors
-                            .insert(file_id.clone(), (chunk_idx + 1) % chunk_count);
-
-                        assigned_one = true;
-                        break;
+                    // 避免重複對同端點指派同一片段。
+                    let already_assigned = s
+                        .http_assignments
+                        .get(candidate.endpoint_id.as_str())
+                        .is_some_and(|assignments| {
+                            assignments.iter().any(|a| {
+                                a.file_id == candidate.file_id && a.chunk_index == chunk_idx
+                            })
+                        });
+                    if already_assigned {
+                        continue;
                     }
-                }
 
-                if assigned_one {
+                    selected_chunk = Some(chunk_idx);
                     break;
                 }
+
+                let Some(chunk_idx) = selected_chunk else {
+                    continue;
+                };
+
+                to_assign.push((
+                    candidate.endpoint_id.clone(),
+                    candidate.file_id.clone(),
+                    chunk_idx,
+                ));
+                s.file_last_http_endpoint
+                    .insert(candidate.file_id.clone(), candidate.endpoint_id.clone());
+                s.http_assignments
+                    .entry(candidate.endpoint_id.clone())
+                    .or_default()
+                    .push(p2p::HttpChunkAssignment {
+                        file_id: candidate.file_id.clone(),
+                        chunk_index: chunk_idx,
+                        started: false,
+                        assigned_at: now,
+                    });
+
+                // 下一次同檔案改從下一片開始找，維持片段分散。
+                s.file_chunk_cursors
+                    .insert(candidate.file_id, (chunk_idx + 1) % candidate.chunk_count);
+
+                assigned_one = true;
+                break;
             }
 
             if !assigned_one {
@@ -997,9 +1020,6 @@ async fn host_http_dispatch(state: &ServerState) {
 /// - 不使用 host 作為 WebRTC 來源（host 透過 host_http_dispatch 獨立處理）
 /// - 冷卻中的不穩定來源端點排除在外
 async fn find_and_assign_matches(state: &ServerState) {
-    const MAX_UPLOAD_CONNECTIONS: u32 = 1;
-    const MAX_DOWNLOAD_CONNECTIONS: u32 = 1;
-
     #[derive(Clone)]
     struct Assignment {
         downloader_id: String,
@@ -1019,52 +1039,122 @@ async fn find_and_assign_matches(state: &ServerState) {
 
     let s = state.p2p_state.read().await;
     let host_id = s.host_endpoint_id.clone();
+    let max_upload = s.webrtc_max_upload;
+    let max_download = s.webrtc_max_download;
     let file_chunk_counts: HashMap<String, u32> = s
         .shared_files
         .iter()
         .map(|f| (f.file_id.clone(), f.chunk_count))
         .collect();
 
-    let mut endpoint_ids: Vec<String> = s
-        .endpoints
+    let to_assign: Vec<Assignment> = select_webrtc_assignments(
+        &s.endpoints,
+        &host_id,
+        &file_chunk_counts,
+        &cooldown_snapshot,
+        now,
+        max_upload,
+        max_download,
+    )
+    .into_iter()
+    .map(|assignment| Assignment {
+        downloader_id: assignment.downloader_id,
+        file_id: assignment.file_id,
+        chunk_idx: assignment.chunk_idx,
+        source_id: assignment.source_id,
+        downloader_owned: assignment.downloader_owned,
+        source_owned: assignment.source_owned,
+    })
+    .collect();
+
+    drop(s);
+
+    // 發送所有指派訊息
+    let senders = state.ws_senders.read().await;
+    for c in to_assign {
+        if let Some(tx) = senders.get(&c.downloader_id) {
+            let _ = tx.send(ServerMessage::SuggestDownload {
+                file_id: c.file_id.clone(),
+                chunk_index: c.chunk_idx,
+                source_peer: c.source_id.clone(),
+            });
+            println!(
+                "[WebRTC配對] ts={} 檔案={} 片段={} | {} <- {}（src持有={} dst進度={}）",
+                log_timestamp(),
+                &c.file_id[..8.min(c.file_id.len())],
+                c.chunk_idx,
+                &c.downloader_id[..8.min(c.downloader_id.len())],
+                &c.source_id[..8.min(c.source_id.len())],
+                c.source_owned,
+                c.downloader_owned
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MatchAssignment {
+    downloader_id: String,
+    file_id: String,
+    chunk_idx: u32,
+    source_id: String,
+    downloader_owned: u32,
+    source_owned: u32,
+}
+
+fn select_webrtc_assignments(
+    endpoints: &HashMap<String, p2p::EndpointState>,
+    host_id: &str,
+    file_chunk_counts: &HashMap<String, u32>,
+    cooldown_snapshot: &HashMap<String, Instant>,
+    now: Instant,
+    max_upload_connections: u32,
+    max_download_connections: u32,
+) -> Vec<MatchAssignment> {
+    let mut endpoint_ids: Vec<String> = endpoints
         .keys()
-        .filter(|id| id.as_str() != host_id.as_str())
+        .filter(|id| id.as_str() != host_id)
         .cloned()
         .collect();
     endpoint_ids.sort();
 
-    // 每輪每個來源端點最多指派一筆，避免單一來源壟斷。
-    let mut to_assign: Vec<Assignment> = Vec::new();
-    let mut assigned_downloaders: HashSet<String> = HashSet::new();
+    // 每輪記錄每個下載端已被指派筆數，最多允許 max_download_connections 筆同時。
+    let mut to_assign: Vec<MatchAssignment> = Vec::new();
+    let mut assigned_downloaders: HashMap<String, u32> = HashMap::new();
 
     for source_id in &endpoint_ids {
-        let Some(source_ep) = s.endpoints.get(source_id) else {
+        let Some(source_ep) = endpoints.get(source_id) else {
             continue;
         };
 
-        if source_ep.upload_count >= MAX_UPLOAD_CONNECTIONS {
+        if source_ep.upload_count >= max_upload_connections {
             continue;
         }
 
         if cooldown_snapshot
             .get(source_id.as_str())
-            .map_or(false, |until| *until > now)
+            .is_some_and(|until| *until > now)
         {
             continue;
         }
 
-        let mut assigned_for_this_source = false;
-
         for downloader_id in &endpoint_ids {
-            if downloader_id == source_id || assigned_downloaders.contains(downloader_id) {
+            if downloader_id == source_id
+                || assigned_downloaders
+                    .get(downloader_id)
+                    .copied()
+                    .unwrap_or(0)
+                    >= max_download_connections
+            {
                 continue;
             }
 
-            let Some(downloader_ep) = s.endpoints.get(downloader_id) else {
+            let Some(downloader_ep) = endpoints.get(downloader_id) else {
                 continue;
             };
 
-            if downloader_ep.download_count >= MAX_DOWNLOAD_CONNECTIONS {
+            // 中控分派前檢查目標端下載連線容量。
+            if downloader_ep.download_count >= max_download_connections {
                 continue;
             }
 
@@ -1096,11 +1186,12 @@ async fn find_and_assign_matches(state: &ServerState) {
                 continue;
             }
 
+            // 僅在目標端缺少且來源端持有片段時才可建立分派。
             let mut selected_chunk: Option<u32> = None;
 
             for chunk_idx in 0..chunk_count {
                 let downloader_has =
-                    downloader_owned_chunks.map_or(false, |chunks| chunks.contains(&chunk_idx));
+                    downloader_owned_chunks.is_some_and(|chunks| chunks.contains(&chunk_idx));
                 if !downloader_has && source_owned_chunks.contains(&chunk_idx) {
                     selected_chunk = Some(chunk_idx);
                     break;
@@ -1108,12 +1199,13 @@ async fn find_and_assign_matches(state: &ServerState) {
             }
 
             let Some(chunk_idx) = selected_chunk else {
-                // 這個目標端點缺的片段來源端都沒有，改試下一個目標端點。
                 continue;
             };
 
-            assigned_downloaders.insert(downloader_id.clone());
-            to_assign.push(Assignment {
+            *assigned_downloaders
+                .entry(downloader_id.clone())
+                .or_insert(0) += 1;
+            to_assign.push(MatchAssignment {
                 downloader_id: downloader_id.clone(),
                 file_id: file_id.clone(),
                 chunk_idx,
@@ -1121,37 +1213,140 @@ async fn find_and_assign_matches(state: &ServerState) {
                 downloader_owned: downloader_owned_count,
                 source_owned: source_owned_chunks.len() as u32,
             });
-            assigned_for_this_source = true;
             break;
-        }
-
-        if assigned_for_this_source {
-            continue;
         }
     }
 
-    drop(s);
+    to_assign
+}
 
-    // 發送所有指派訊息
-    let senders = state.ws_senders.read().await;
-    for c in to_assign {
-        if let Some(tx) = senders.get(&c.downloader_id) {
-            let _ = tx.send(ServerMessage::SuggestDownload {
-                file_id: c.file_id.clone(),
-                chunk_index: c.chunk_idx,
-                source_peer: c.source_id.clone(),
-            });
-            println!(
-                "[WebRTC配對] ts={} 檔案={} 片段={} | {} <- {}（src持有={} dst進度={}）",
-                log_timestamp(),
-                &c.file_id[..8.min(c.file_id.len())],
-                c.chunk_idx,
-                &c.downloader_id[..8.min(c.downloader_id.len())],
-                &c.source_id[..8.min(c.source_id.len())],
-                c.source_owned,
-                c.downloader_owned
-            );
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn endpoint(
+        endpoint_id: &str,
+        file_id: Option<&str>,
+        upload_count: u32,
+        download_count: u32,
+        owned: &[u32],
+    ) -> p2p::EndpointState {
+        let mut owned_chunks = HashMap::new();
+        if let Some(fid) = file_id {
+            owned_chunks.insert(fid.to_string(), owned.iter().copied().collect());
         }
+        p2p::EndpointState {
+            endpoint_id: endpoint_id.to_string(),
+            file_id: file_id.map(str::to_string),
+            owned_chunks,
+            upload_count,
+            download_count,
+        }
+    }
+
+    #[test]
+    fn assigns_when_both_directions_have_capacity_and_chunk_missing() {
+        let file_id = "f1".to_string();
+        let mut endpoints = HashMap::new();
+        endpoints.insert("host".to_string(), endpoint("host", None, 0, 0, &[]));
+        endpoints.insert(
+            "src".to_string(),
+            endpoint("src", Some("f1"), 1, 0, &[0, 1]),
+        );
+        endpoints.insert("dst".to_string(), endpoint("dst", Some("f1"), 0, 1, &[0]));
+
+        let mut counts = HashMap::new();
+        counts.insert(file_id.clone(), 2);
+
+        let assignments = select_webrtc_assignments(
+            &endpoints,
+            "host",
+            &counts,
+            &HashMap::new(),
+            Instant::now(),
+            2,
+            2,
+        );
+
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].source_id, "src");
+        assert_eq!(assignments[0].downloader_id, "dst");
+        assert_eq!(assignments[0].chunk_idx, 1);
+    }
+
+    #[test]
+    fn skips_source_when_upload_capacity_is_full() {
+        let mut endpoints = HashMap::new();
+        endpoints.insert("host".to_string(), endpoint("host", None, 0, 0, &[]));
+        endpoints.insert(
+            "src".to_string(),
+            endpoint("src", Some("f1"), 2, 0, &[0, 1]),
+        );
+        endpoints.insert("dst".to_string(), endpoint("dst", Some("f1"), 0, 0, &[0]));
+
+        let mut counts = HashMap::new();
+        counts.insert("f1".to_string(), 2);
+
+        let assignments = select_webrtc_assignments(
+            &endpoints,
+            "host",
+            &counts,
+            &HashMap::new(),
+            Instant::now(),
+            2,
+            2,
+        );
+
+        assert!(assignments.is_empty());
+    }
+
+    #[test]
+    fn skips_downloader_when_download_capacity_is_full() {
+        let mut endpoints = HashMap::new();
+        endpoints.insert("host".to_string(), endpoint("host", None, 0, 0, &[]));
+        endpoints.insert(
+            "src".to_string(),
+            endpoint("src", Some("f1"), 0, 0, &[0, 1]),
+        );
+        endpoints.insert("dst".to_string(), endpoint("dst", Some("f1"), 0, 2, &[0]));
+
+        let mut counts = HashMap::new();
+        counts.insert("f1".to_string(), 2);
+
+        let assignments = select_webrtc_assignments(
+            &endpoints,
+            "host",
+            &counts,
+            &HashMap::new(),
+            Instant::now(),
+            2,
+            2,
+        );
+
+        assert!(assignments.is_empty());
+    }
+
+    #[test]
+    fn skips_when_downloader_has_no_missing_chunks_from_source() {
+        let mut endpoints = HashMap::new();
+        endpoints.insert("host".to_string(), endpoint("host", None, 0, 0, &[]));
+        endpoints.insert("src".to_string(), endpoint("src", Some("f1"), 0, 0, &[0]));
+        endpoints.insert("dst".to_string(), endpoint("dst", Some("f1"), 0, 0, &[0]));
+
+        let mut counts = HashMap::new();
+        counts.insert("f1".to_string(), 2);
+
+        let assignments = select_webrtc_assignments(
+            &endpoints,
+            "host",
+            &counts,
+            &HashMap::new(),
+            Instant::now(),
+            2,
+            2,
+        );
+
+        assert!(assignments.is_empty());
     }
 }
 
